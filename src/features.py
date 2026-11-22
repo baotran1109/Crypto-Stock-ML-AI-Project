@@ -6,11 +6,19 @@ Compute indicators and prepare supervised learning dataset (pure pandas).
 import numpy as np
 import pandas as pd
 
-# Expanded feature list
+HORIZON = 5  # predict whether close is higher HORIZON trading bars ahead
+
+# Model features. All are scale-free (ratios, returns, oscillators) so one model
+# can learn patterns that transfer between a $60k coin, a $0.50 coin and a stock.
+# Raw dollar-valued indicators (ema12, bb_mid, ...) are still computed for charts
+# but are deliberately NOT model inputs.
 FEATURE_COLS = [
-    "rsi", "ema12", "ema26", "macd", "macd_signal", "macd_hist",
-    "bb_low", "bb_mid", "bb_high",
-    "ret1", "ret5", "vol20", "ema_ratio", "bb_width", "above_ema"
+    "rsi",
+    "close_ema12", "close_ema26", "ema_ratio",
+    "macd_pct", "macd_signal_pct", "macd_hist_pct",
+    "bb_pos", "bb_width",
+    "ret1", "ret5", "ret20", "vol20", "vol_ratio",
+    "above_ema",
 ]
 
 def _as_series(df: pd.DataFrame, name: str) -> pd.Series:
@@ -85,24 +93,45 @@ def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
     core["bb_mid"] = bb_mid
     core["bb_high"] = bb_high
 
-    # === New engineered features ===
-    core["ret1"] = core["close"].pct_change(1)
-    core["ret5"] = core["close"].pct_change(5)
+    # === Scale-free engineered features ===
+    close_ = core["close"]
+    core["ret1"] = close_.pct_change(1)
+    core["ret5"] = close_.pct_change(5)
+    core["ret20"] = close_.pct_change(20)
     core["vol20"] = core["ret1"].rolling(20).std()
+    core["vol_ratio"] = core["ret1"].rolling(5).std() / core["vol20"]
 
+    core["close_ema12"] = close_ / core["ema12"] - 1
+    core["close_ema26"] = close_ / core["ema26"] - 1
     core["ema_ratio"] = core["ema12"] / core["ema26"] - 1
-    core["bb_width"] = (core["bb_high"] - core["bb_low"]) / core["bb_mid"]
-    core["above_ema"] = (core["close"] > core["ema26"]).astype(int)
+    core["macd_pct"] = core["macd"] / close_
+    core["macd_signal_pct"] = core["macd_signal"] / close_
+    core["macd_hist_pct"] = core["macd_hist"] / close_
 
-    # Drop only rows where the core features are all NaN
+    band = (core["bb_high"] - core["bb_low"]).replace(0, np.nan)
+    core["bb_pos"] = (close_ - core["bb_low"]) / band
+    core["bb_width"] = band / core["bb_mid"]
+    core["above_ema"] = (close_ > core["ema26"]).astype(int)
+
+    core = core.replace([np.inf, -np.inf], np.nan)
+
+    # Drop warm-up rows where most indicators are still undefined
     core = core.dropna(thresh=int(len(core.columns) * 0.5))
 
     return core
 
-def make_supervised(df: pd.DataFrame):
+
+def make_supervised(df: pd.DataFrame, horizon: int = HORIZON):
+    """
+    Features at bar t only use data up to and including bar t's close, so they
+    are known when the decision is made at t's close. Target: close[t+horizon] > close[t].
+    The last `horizon` rows have no known future and are dropped (not labelled DOWN).
+    Prediction at runtime uses the latest row exactly the same way.
+    """
     if df.empty:
         return pd.DataFrame(), pd.Series(dtype=int)
-    X = df[FEATURE_COLS].shift(1).dropna()
-    # Predict 5-day ahead movement
-    y = (df["close"].shift(-5) > df["close"]).astype(int).loc[X.index]
+    future = df["close"].shift(-horizon)
+    valid = future.notna() & df[FEATURE_COLS].notna().all(axis=1)
+    X = df.loc[valid, FEATURE_COLS]
+    y = (future[valid] > df.loc[valid, "close"]).astype(int)
     return X, y

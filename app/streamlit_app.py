@@ -14,7 +14,7 @@ import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 from src.data_loader import load_crypto
 from src.features import add_indicators
-from src.backtest import run_backtest
+from src.backtest import run_backtest, load_training_metadata
 
 st.set_page_config(page_title="Crypto/Stock Machine Learning Predictor", page_icon="🪙", layout="wide")
 st.title("Crypto/Stock Machine Learning Predictor 🪙")
@@ -23,81 +23,100 @@ st.title("Crypto/Stock Machine Learning Predictor 🪙")
 page = st.sidebar.selectbox("Choose a page", ["Prediction", "Model Performance", "Backtest"])
 
 # Load model and metadata (cache for performance)
-@st.cache_data
+@st.cache_resource
 def load_model_artifacts():
     try:
         model = joblib.load("artifacts/general_crypto_model.pkl")
         cols = joblib.load("artifacts/feature_columns.pkl")
         eval_metrics = None
         feature_importance = None
-        
+
         try:
             eval_metrics = joblib.load("artifacts/evaluation_metrics.pkl")
         except FileNotFoundError:
             pass
-        
+
         try:
             feature_importance = joblib.load("artifacts/feature_importance.pkl")
         except FileNotFoundError:
             pass
-        
+
         return model, cols, eval_metrics, feature_importance
     except FileNotFoundError as e:
         return None, None, None, None
 
 model, cols, eval_metrics, feature_importance = load_model_artifacts()
+training_meta = load_training_metadata()
 
 if model is None:
     st.error("❌ Model files not found. Run `python -m src.train_model` first.")
     st.stop()
+
+if training_meta is None:
+    st.warning("⚠️ These model files are from an older version of the project. "
+               "Run `python -m src.train_model` to retrain before using the app.")
+else:
+    st.sidebar.caption(
+        f"Model trained on {', '.join(training_meta['symbols'])}\n\n"
+        f"Train: {training_meta['train_start']} → {training_meta['train_end']}\n\n"
+        f"Test: {training_meta['test_start']} → {training_meta['test_end']}"
+    )
 
 # ==========================================================
 # PREDICTION PAGE
 # ==========================================================
 if page == "Prediction":
     symbol = st.text_input("Enter symbol (e.g BTC-USD,ETH-USD,AAPL):", "BTC-USD")
-    
+
     col1, col2 = st.columns([2, 1])
-    
+
     with col2:
         show_candlestick = st.checkbox("Show Candlestick Chart", value=True)
         chart_days = st.slider("Chart Days", 30, 500, 300)
-    
+
     if st.button("Predict", type="primary"):
         with st.spinner(f"Fetching {symbol} data..."):
-            df = load_crypto(symbol, force_refresh=False)
-            df = add_indicators(df)
-            
-            if df.empty:
+            try:
+                df = add_indicators(load_crypto(symbol, force_refresh=False))
+            except Exception as e:
+                df = None
+                st.error(f"Could not load data for '{symbol}': {e}")
+
+            if df is None:
+                pass
+            elif df.empty:
                 st.error("No indicator rows available for this symbol (try a longer lookback or another symbol).")
             else:
-                latest = df.tail(1)
-                
-                # Build X with EXACT training columns (fill missing with 0)
-                X = pd.DataFrame(index=latest.index)
-                for c in cols:
-                    X[c] = latest[c] if c in latest.columns else 0
-                X = X[cols]
-                
-                if X.shape[0] == 0:
+                # Same features the model was trained on, from the latest complete bar
+                missing = [c for c in cols if c not in df.columns]
+                X = df[cols].dropna().tail(1) if not missing else pd.DataFrame()
+
+                if missing:
+                    st.error(f"Saved model expects features {missing}. Retrain with `python -m src.train_model`.")
+                elif X.empty:
                     st.error("Couldn't build a feature row (latest bar may be incomplete). Try again later or use a different symbol.")
                 else:
-                    pred = model.predict(X)[0]
-                    prob = model.predict_proba(X)[0, 1] if hasattr(model, "predict_proba") else 0.5
+                    prob = model.predict_proba(X)[0, 1]
+                    pred = int(prob > 0.5)
+                    horizon = training_meta.get("horizon", 5) if training_meta else 5
+                    st.caption(f"Prediction for {horizon} bars after the {X.index[-1].date()} close.")
+                    if training_meta and symbol.upper() not in [s.upper() for s in training_meta["symbols"]]:
+                        st.info(f"ℹ️ {symbol.upper()} was not in the training set ({', '.join(training_meta['symbols'])}). "
+                                "The features are scale-free so the model still applies, but treat it as an out-of-domain guess.")
                     
                     # Display prediction
                     col1, col2, col3 = st.columns(3)
                     with col1:
                         st.metric("Prediction", "📈 UP" if pred == 1 else "📉 DOWN")
                     with col2:
-                        st.metric("Confidence", f"{prob:.2%}")
+                        st.metric("P(up)", f"{prob:.2%}")
                     with col3:
                         current_price = df.iloc[-1]['close']
                         st.metric("Current Price", f"${current_price:,.2f}")
-                    
+
                     # Chart
                     chart_data = df.tail(chart_days)
-                    
+
                     if show_candlestick and all(col in chart_data.columns for col in ['open', 'high', 'low', 'close']):
                         # Candlestick chart
                         fig = make_subplots(
@@ -107,7 +126,7 @@ if page == "Prediction":
                             subplot_titles=(f'{symbol} Price', 'Volume'),
                             row_width=[0.7, 0.3]
                         )
-                        
+
                         # Candlestick
                         fig.add_trace(
                             go.Candlestick(
@@ -120,26 +139,26 @@ if page == "Prediction":
                             ),
                             row=1, col=1
                         )
-                        
+
                         # Volume
-                        colors = ['red' if chart_data['close'].iloc[i] < chart_data['open'].iloc[i] 
+                        colors = ['red' if chart_data['close'].iloc[i] < chart_data['open'].iloc[i]
                                  else 'green' for i in range(len(chart_data))]
                         fig.add_trace(
                             go.Bar(x=chart_data.index, y=chart_data['volume'], name="Volume", marker_color=colors),
                             row=2, col=1
                         )
-                        
+
                         fig.update_layout(
                             height=600,
                             xaxis_rangeslider_visible=False,
                             showlegend=False,
                             template="plotly_white"
                         )
-                        st.plotly_chart(fig, use_container_width=True)
+                        st.plotly_chart(fig)
                     else:
                         # Simple line chart
                         st.line_chart(chart_data[["close"]])
-                    
+
                     # Show recent indicators
                     with st.expander("📊 Recent Technical Indicators"):
                         indicator_cols = ['rsi', 'ema12', 'ema26', 'macd', 'bb_low', 'bb_mid', 'bb_high']
@@ -153,10 +172,10 @@ if page == "Prediction":
 # ==========================================================
 elif page == "Model Performance":
     st.header("📊 Model Performance Metrics")
-    
+
     if eval_metrics:
         col1, col2, col3, col4 = st.columns(4)
-        
+
         with col1:
             st.metric("Accuracy", f"{eval_metrics['accuracy']:.3f}")
         with col2:
@@ -165,7 +184,7 @@ elif page == "Model Performance":
             st.metric("Recall", f"{eval_metrics['recall']:.3f}")
         with col4:
             st.metric("F1-Score", f"{eval_metrics['f1_score']:.3f}")
-        
+
         if eval_metrics.get('roc_auc'):
             col1, col2 = st.columns(2)
             with col1:
@@ -173,8 +192,20 @@ elif page == "Model Performance":
             with col2:
                 baseline = eval_metrics.get('baseline_accuracy', 0.5)
                 improvement = eval_metrics['accuracy'] - baseline
-                st.metric("vs Baseline", f"+{improvement:.3f}")
-        
+                st.metric("Accuracy vs Baseline", f"{improvement:+.3f}",
+                          help=f"Baseline = always predicting the majority class ({baseline:.3f})")
+            st.caption("ROC-AUC of 0.5 means no better than random. Metrics are on the held-out test period"
+                       + (f" ({training_meta['test_start']} → {training_meta['test_end']})." if training_meta else "."))
+
+        if eval_metrics.get('cv_accuracy') is not None:
+            col1, col2 = st.columns(2)
+            col1.metric("Walk-forward CV Accuracy", f"{eval_metrics['cv_accuracy']:.3f}")
+            col2.metric("Walk-forward CV ROC-AUC", f"{eval_metrics['cv_roc_auc']:.3f}")
+
+        if eval_metrics.get('per_symbol'):
+            st.subheader("Per-symbol test results")
+            st.dataframe(pd.DataFrame(eval_metrics['per_symbol']).T, width="stretch")
+
         # Confusion Matrix
         st.subheader("Confusion Matrix")
         cm = np.array(eval_metrics['confusion_matrix'])
@@ -183,8 +214,8 @@ elif page == "Model Performance":
             index=['Actual DOWN', 'Actual UP'],
             columns=['Predicted DOWN', 'Predicted UP']
         )
-        st.dataframe(cm_df, use_container_width=True)
-        
+        st.dataframe(cm_df, width="stretch")
+
         # Feature Importance
         if feature_importance:
             st.subheader("🔍 Feature Importance")
@@ -192,7 +223,7 @@ elif page == "Model Performance":
                 list(feature_importance.items()),
                 columns=['Feature', 'Importance']
             ).sort_values('Importance', ascending=False)
-            
+
             # Bar chart
             fig = go.Figure(data=[
                 go.Bar(
@@ -209,11 +240,11 @@ elif page == "Model Performance":
                 height=600,
                 template="plotly_white"
             )
-            st.plotly_chart(fig, use_container_width=True)
-            
+            st.plotly_chart(fig)
+
             # Table
             with st.expander("View All Features"):
-                st.dataframe(feature_df, use_container_width=True)
+                st.dataframe(feature_df, width="stretch")
     else:
         st.warning("⚠️ Evaluation metrics not found. Run `python -m src.train_model` to generate metrics.")
 
@@ -222,14 +253,14 @@ elif page == "Model Performance":
 # ==========================================================
 elif page == "Backtest":
     st.header("🧪 Strategy Backtesting")
-    
+
     col1, col2 = st.columns(2)
     with col1:
-        symbol = st.text_input("Symbol to Backtest", "BTC-USD", 
+        symbol = st.text_input("Symbol to Backtest", "BTC-USD",
                               help="Use format: BTC-USD, ETH-USD, AAPL, TSLA, etc. (Not BTC-USDT)")
     with col2:
         confidence_threshold = st.slider("Confidence Threshold", 0.0, 1.0, 0.5, 0.05)
-    
+
     # Show common symbols as suggestions
     with st.expander("💡 Common Symbols"):
         col1, col2 = st.columns(2)
@@ -241,7 +272,7 @@ elif page == "Backtest":
             st.write("**Stocks:**")
             st.write("AAPL, TSLA, MSFT, GOOGL")
             st.write("META, NVDA, AMZN, SPY")
-    
+
     col1, col2, col3 = st.columns(3)
     with col1:
         initial_capital = st.number_input("Initial Capital ($)", 1000, 1000000, 10000)
@@ -249,6 +280,10 @@ elif page == "Backtest":
         commission = st.number_input("Commission (%)", 0.0, 1.0, 0.1, 0.01) / 100
     with col3:
         lookback_years = st.selectbox("Lookback Period", ["1y", "2y", "3y", "5y"], index=3)
+
+    out_of_sample = st.checkbox(
+        "Out-of-sample only (after the model's training period)", value=True,
+        help="Unticking this lets the backtest include dates the model was trained on, which inflates results.")
     
     if st.button("Run Backtest", type="primary"):
         with st.spinner("Running backtest... This may take a minute."):
@@ -257,12 +292,13 @@ elif page == "Backtest":
                 confidence_threshold=confidence_threshold,
                 initial_capital=initial_capital,
                 commission=commission,
-                lookback=lookback_years
+                lookback=lookback_years,
+                out_of_sample=out_of_sample,
             )
-            
+
             if "error" in results:
                 st.error(f"❌ {results['error']}")
-                
+
                 # Show diagnostics if available
                 if "diagnostics" in results:
                     with st.expander("🔍 Diagnostic Information"):
@@ -277,7 +313,7 @@ elif page == "Backtest":
                         with col3:
                             st.metric("Total Predictions", diag.get('total_predictions_processed', 0))
                             st.metric("Confidence Threshold", f"{diag.get('confidence_threshold', 0.5):.2f}")
-                
+
                 # Provide additional help
                 if "USDT" in symbol.upper() or "not found" in results['error'].lower():
                     st.info("💡 **Tip:** Use '-USD' format for cryptocurrencies (e.g., BTC-USD, not BTC-USDT). For stocks, use the ticker symbol (e.g., AAPL, TSLA).")
@@ -291,8 +327,13 @@ elif page == "Backtest":
             else:
                 # Key Metrics
                 st.subheader("📈 Backtest Results")
+                st.caption(f"Period: {results['period_start']} → {results['period_end']} · "
+                           f"buy if P(up) > {results['buy_threshold']:.3f}, exit if P(up) < {results['sell_threshold']:.3f}")
+                if results.get('in_sample_overlap'):
+                    st.warning("⚠️ This period overlaps the data the model was trained on for this symbol, "
+                               "so these results are optimistic.")
                 col1, col2, col3, col4 = st.columns(4)
-                
+
                 with col1:
                     st.metric("Total Return", f"{results['total_return']:.2%}")
                     st.metric("Buy & Hold Return", f"{results['buy_hold_return']:.2%}")
@@ -305,7 +346,7 @@ elif page == "Backtest":
                 with col4:
                     st.metric("Sharpe Ratio", f"{results['sharpe_ratio']:.2f}")
                     st.metric("Max Drawdown", f"{results['max_drawdown']:.2%}")
-                
+
                 # Equity Curve
                 if results.get('equity_curve') and len(results['equity_curve']) > 1:
                     st.subheader("💰 Equity Curve")
@@ -314,7 +355,7 @@ elif page == "Backtest":
                         'Date': pd.to_datetime(results['dates'][:len(results['equity_curve'])])
                     })
                     equity_df = equity_df.set_index('Date')
-                    
+
                     fig = go.Figure()
                     fig.add_trace(go.Scatter(
                         x=equity_df.index,
@@ -323,20 +364,17 @@ elif page == "Backtest":
                         name='Strategy Equity',
                         line=dict(color='blue', width=2)
                     ))
-                    
-                    # Add buy & hold comparison
-                    if len(equity_df) > 0:
-                        buy_hold_start = equity_df['Equity'].iloc[0]
-                        buy_hold_end = buy_hold_start * (1 + results['buy_hold_return'])
-                        buy_hold_line = np.linspace(buy_hold_start, buy_hold_end, len(equity_df))
+
+                    # Buy & hold: the actual price path, scaled to the starting capital
+                    if results.get('buy_hold_curve'):
                         fig.add_trace(go.Scatter(
                             x=equity_df.index,
-                            y=buy_hold_line,
+                            y=results['buy_hold_curve'][:len(equity_df)],
                             mode='lines',
                             name='Buy & Hold',
                             line=dict(color='gray', width=2, dash='dash')
                         ))
-                    
+
                     fig.update_layout(
                         title="Equity Curve vs Buy & Hold",
                         xaxis_title="Date",
@@ -345,8 +383,8 @@ elif page == "Backtest":
                         template="plotly_white",
                         hovermode='x unified'
                     )
-                    st.plotly_chart(fig, use_container_width=True)
-                
+                    st.plotly_chart(fig)
+
                 # Trade Details
                 if results.get('trades') and len(results['trades']) > 0:
                     st.subheader("📋 Trade History")
@@ -354,10 +392,10 @@ elif page == "Backtest":
                     trades_df['entry_date'] = pd.to_datetime(trades_df['entry_date'])
                     trades_df['exit_date'] = pd.to_datetime(trades_df['exit_date'])
                     trades_df['return'] = trades_df['return'] * 100
-                    
+
                     # Format for display
-                    display_cols = ['entry_date', 'exit_date', 'entry_price', 'exit_price', 
-                                  'return', 'correct', 'confidence']
+                    display_cols = ['entry_date', 'exit_date', 'entry_price', 'exit_price',
+                                  'return', 'correct', 'confidence', 'open_at_end']
                     available_cols = [col for col in display_cols if col in trades_df.columns]
                     st.dataframe(
                         trades_df[available_cols].style.format({
@@ -366,10 +404,10 @@ elif page == "Backtest":
                             'return': '{:.2f}%',
                             'confidence': '{:.2%}'
                         }),
-                        use_container_width=True,
+                        width="stretch",
                         height=300
                     )
-                    
+
                     # Trade Statistics
                     col1, col2 = st.columns(2)
                     with col1:

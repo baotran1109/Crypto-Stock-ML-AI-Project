@@ -84,12 +84,31 @@ def _normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
     Ensure lowercase canonical names and a consistent column set.
     Returns only: open, high, low, close, volume
     """
-    df = df.rename(columns=str.lower)
+    if isinstance(df.columns, pd.MultiIndex):
+        # yfinance >= 0.2.5x returns (field, ticker) columns even for one ticker
+        df = df.copy()
+        df.columns = df.columns.get_level_values(0)
+    df = df.rename(columns=lambda c: str(c).lower())
+    df = df.loc[:, ~pd.Index(df.columns).duplicated(keep="first")]
     cols = ["open", "high", "low", "close", "volume"]
     for c in cols:
         if c not in df.columns:
             df[c] = float("nan")
     return df[cols]
+
+def _read_cache(path: str) -> pd.DataFrame:
+    """
+    Read a cached CSV and drop junk rows (e.g. the ticker row that older
+    versions of this loader wrote when yfinance returned MultiIndex columns).
+    """
+    df = pd.read_csv(path)
+    df["time"] = pd.to_datetime(df["time"], errors="coerce")
+    df = df.dropna(subset=["time"]).set_index("time").sort_index()
+    df = _normalize_columns(df)
+    df = df.apply(pd.to_numeric, errors="coerce")
+    df = df.dropna(subset=["close"])
+    df = _normalize_index_utc_tznaive(df)
+    return df
 
 def _normalize_index_utc_tznaive(df: pd.DataFrame) -> pd.DataFrame:
     """
@@ -136,9 +155,9 @@ def _fetch_yahoo(symbol: str, period: str = YF_PERIOD_DEFAULT, interval: str = Y
     df = yf.download(symbol, period=period, interval=interval, progress=False,auto_adjust=False)
     if df is None or df.empty:
         return pd.DataFrame()
-    df = df.dropna()
-    df.index.name = "time"
     df = _normalize_columns(df)
+    df = df.dropna(subset=["close"])
+    df.index.name = "time"
     df = _normalize_index_utc_tznaive(df)
     return df
 
@@ -259,9 +278,7 @@ def load_crypto(
     if prefer in ("auto", "yahoo"):
         cache_y = _cache_path(symbol, "yahoo", lookback)
         if use_cache and not force_refresh and _is_fresh(cache_y, fresh_hours):
-            df_y = pd.read_csv(cache_y, parse_dates=["time"]).set_index("time")
-            df_y = _normalize_columns(df_y)
-            df_y = _normalize_index_utc_tznaive(df_y)
+            df_y = _read_cache(cache_y)
             df_y["source"] = "yahoo"
             df_y["symbol"] = symbol.upper()
             return df_y
@@ -282,9 +299,7 @@ def load_crypto(
         cg_days = _lookback_to_cg_days(lookback)
         cache_cg = _cache_path(symbol, "coingecko", str(cg_days))
         if use_cache and not force_refresh and _is_fresh(cache_cg, fresh_hours):
-            df_cg = pd.read_csv(cache_cg, parse_dates=["time"]).set_index("time")
-            df_cg = _normalize_columns(df_cg)
-            df_cg = _normalize_index_utc_tznaive(df_cg)
+            df_cg = _read_cache(cache_cg)
             df_cg["source"] = "coingecko"
             df_cg["symbol"] = symbol.upper()
             return df_cg
@@ -305,6 +320,22 @@ def load_crypto(
             if prefer == "coingecko":
                 raise
         
+    # Last resort: a stale cache is better than nothing (e.g. offline, rate-limited)
+    if use_cache:
+        candidates = []
+        if prefer in ("auto", "yahoo"):
+            candidates.append((_cache_path(symbol, "yahoo", lookback), "yahoo"))
+        if prefer in ("auto", "coingecko"):
+            candidates.append((_cache_path(symbol, "coingecko", _lookback_to_cg_days(lookback)), "coingecko"))
+        for path, source in candidates:
+            if os.path.exists(path):
+                df_stale = _read_cache(path)
+                if not df_stale.empty:
+                    df_stale["source"] = source
+                    df_stale["symbol"] = symbol.upper()
+                    df_stale.attrs["stale_cache"] = True
+                    return df_stale
+
     raise DataLoadError(f"Failed to load data for symbol '{symbol}' from preferred source(s).")
 # ------------------------ CLI ----------------------------
 

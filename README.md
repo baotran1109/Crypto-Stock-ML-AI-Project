@@ -5,20 +5,20 @@ A machine learning project that predicts short-term price direction for cryptocu
 ## What It Does
 
 - Loads OHLCV data for crypto and stocks from Yahoo Finance, with CoinGecko as a fallback for some coins.
-- Builds technical indicators (RSI, EMAs, MACD, Bollinger Bands, returns, volatility) and a supervised dataset that predicts whether price will be higher in 5 days.
-- Trains a Random Forest classifier on multiple symbols, evaluates it with time-series cross-validation, and saves the model and metrics.
-- Backtests a strategy that buys and sells based on model confidence using the Backtrader framework.
+- Builds scale-free technical features (RSI, price vs EMAs, MACD as % of price, Bollinger Band position/width, returns, volatility) and a supervised dataset that predicts whether price will be higher in 5 days.
+- Trains one Random Forest classifier on several coins, splits train/test by date (with a gap so labels never overlap), evaluates it with walk-forward cross-validation, and saves the model, metrics and training dates.
+- Backtests a long-only strategy that trades on model confidence using the Backtrader framework, by default only on dates after the training period.
 - Provides a Streamlit app with three pages: live prediction, model performance metrics, and backtesting.
 
 ## Project Structure
 
 - **src/data_loader.py** – Loads OHLCV from Yahoo Finance (and CoinGecko when needed). Caches data as CSV under the data folder. Normalizes column names and timezone.
-- **src/features.py** – Adds technical indicators and builds the supervised dataset (5-day ahead up/down target).
-- **src/train_model.py** – Trains the model on several symbols, runs time-series CV, saves the model, feature list, evaluation metrics, and feature importance to the artifacts folder.
+- **src/features.py** – Adds technical indicators and builds the supervised dataset (5-day ahead up/down target). Only scale-free columns in `FEATURE_COLS` are model inputs; raw dollar indicators are kept for charts.
+- **src/train_model.py** – Trains the model on several symbols with a date-based split and walk-forward CV; saves the model, feature list, evaluation metrics, feature importance, and training metadata (train/test dates) to the artifacts folder.
 - **src/backtest.py** – Runs a Backtrader backtest where the strategy trades on model predictions; returns returns, win rate, Sharpe ratio, drawdown, equity curve, and trade list.
 - **app/streamlit_app.py** – Streamlit UI: Prediction (symbol and chart), Model Performance (metrics and feature importance), Backtest (parameters and results).
 - **data/** – Cached CSV files per symbol, source, and lookback (e.g. BTC_USD yahoo 5y).
-- **artifacts/** – Saved model (general_crypto_model.pkl), feature columns, evaluation metrics, feature importance.
+- **artifacts/** – Saved model (general_crypto_model.pkl), feature columns, evaluation metrics, feature importance, training metadata.
 
 ## Requirements
 
@@ -40,12 +40,15 @@ A machine learning project that predicts short-term price direction for cryptocu
 
 ## Data and Model
 
-- Data is cached under **data/** with filenames like SYMBOL__source__lookback.csv. Yahoo is tried first; CoinGecko is used as fallback for supported coins (e.g. BTC, ETH, SOL).
-- The model predicts a binary target: whether close price in 5 days is above current close (1) or not (0). Features include RSI, EMAs, MACD, Bollinger Bands, returns, volatility, and derived ratios.
+- Data is cached under **data/** with filenames like SYMBOL__source__lookback.csv. Yahoo is tried first; CoinGecko is used as fallback for supported coins (e.g. BTC, ETH, SOL). A cache older than 12 hours is re-downloaded; if the download fails, the stale cache is used.
+- The model predicts a binary target: whether close price in 5 days is above current close (1) or not (0). The last 5 days of history have no known outcome and are excluded from training. Features use only data up to the decision bar's close, and live prediction uses the latest bar the same way.
+- Because features are ratios rather than dollar values, the same model can be applied to stocks, but it was trained on crypto only, so stock predictions are out of domain.
 - Artifacts are written to **artifacts/**: the trained model, feature column list, evaluation metrics, and feature importance. The Streamlit app and backtest both rely on these files.
 
 ## Notes
 
 - Use symbol format BTC-USD, ETH-USD for crypto (not BTC-USDT). Use ticker symbols like AAPL, TSLA for stocks.
 - If the app says model files not found, run `python -m src.train_model` first.
-- Backtest needs enough history (e.g. 5y) and may produce no trades if the confidence threshold is too high; try lowering it or using a longer lookback.
+- The backtest is out-of-sample by default: it starts after the model's training period. Unticking that option includes training data and makes results look much better than they are.
+- Orders fill at the signal bar's close with fractional position sizes, so expensive assets like BTC can be traded with small capital.
+- Honest expectation: with daily technical indicators alone, the model's out-of-sample ROC-AUC is about 0.50 (no better than random). Check the Model Performance page before reading anything into backtest results.
