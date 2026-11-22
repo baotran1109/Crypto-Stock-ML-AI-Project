@@ -19,6 +19,9 @@ A machine learning project that predicts short-term price direction for cryptocu
 - **src/model_registry.py** – Training universes per asset class, `asset_class_for(symbol)`, and loading each class's artifacts.
 - **src/train_model.py** – Trains the crypto and stock models with a date-based split and walk-forward CV; saves each to `artifacts/<asset_class>/`.
 - **src/backtest.py** – One signal-driven Backtrader engine for the ML strategy, the benchmarks and the shuffle test, with optional risk rules.
+- **src/alt_data.py** – Non-price data from free sources, cached under data/alt/:
+  - Crypto: Fear & Greed index, Deribit BTC/ETH funding rates and Hyperliquid per-coin funding rates.
+  - Stocks: yfinance earnings and analyst actions, and FRED macro series.
 - **src/research.py** – Signal research harness (walk-forward grid over targets × feature sets × models, and a crypto rotation simulation). Writes `reports/`.
 - **app/streamlit_app.py** – Streamlit UI.
 - **data/** – Cached CSV files per symbol, source, and lookback (e.g. BTC_USD yahoo 5y).
@@ -27,7 +30,7 @@ A machine learning project that predicts short-term price direction for cryptocu
 
 ## Requirements
 
-- Python 3 with packages listed in requirements.txt: streamlit, pandas, numpy, scikit-learn, joblib, yfinance, requests, urllib3, plotly, backtrader.
+- Python 3 with packages listed in requirements.txt: streamlit, pandas, numpy, scikit-learn, joblib, yfinance, requests, urllib3, plotly, backtrader, lxml.
 
 ## Setup
 
@@ -76,10 +79,11 @@ These apply to every strategy in a run, not just the ML model.
 
 ## Research Findings (short version)
 
-See `reports/FINDINGS.md` for detail. Across 100+ walk-forward experiments:
+See `reports/FINDINGS.md` for detail. Across 170+ walk-forward experiments:
 
 - **Price direction (up/down in 5 or 20 days) is not predictable** from these features, for crypto or stocks. Test ROC-AUC stays around 0.50.
 - **Volatility is predictable**: whether the next 5 days will have a big move scores ROC-AUC ~0.55 (crypto) and ~0.58 (stocks), in every test period. That supports volatility-based sizing, not direction calls.
+- **Non-price data** (funding rates, Fear & Greed, earnings surprises, analyst ratings, yield curve, credit spreads) did not make direction predictable. Earnings dates improved volatility prediction for stocks to ~0.60.
 - **Which coin will beat the other coins** over 5 days is weakly predictable (ROC-AUC ~0.52–0.53, every test period), but after trading costs a rotation strategy built on it does not reliably beat holding all coins, and a plain momentum rule beat it in most configurations.
 
 ## Notes

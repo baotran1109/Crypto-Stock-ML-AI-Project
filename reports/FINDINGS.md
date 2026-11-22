@@ -1,8 +1,8 @@
 # Signal Research Findings
 
-**Bottom line:** none of the signals found is strong enough to trade on after costs. Price direction is not predictable from these features. Volatility is. A weak "which coin beats the others" signal exists but loses to simply holding all coins in most setups.
+**Bottom line:** none of the signals found is strong enough to trade on after costs. Price direction is not predictable from these features. Volatility is. A weak "which coin beats the others" signal exists but loses to simply holding all coins in most setups. Adding non-price data (funding rates, Fear & Greed, earnings, analyst ratings, macro) did not change that; see [Round 2](#round-2-non-price-data).
 
-Generated from `python -m src.research` (104 walk-forward experiments + 13 rotation simulations, 10 years of daily data). Full tables: `signal_research.md`.
+Generated from `python -m src.research` (172 walk-forward experiments + 13 rotation simulations, 10 years of daily data). Full tables: `signal_research.md`.
 
 ## How everything was tested
 
@@ -57,14 +57,55 @@ The same model looks brilliant on MSFT and useless on NVDA. One good backtest pr
 1. **The app's up/down predictions are no better than a coin flip** for both asset classes. The Model Performance page shows this.
 2. **Volatility-based position sizing** (Backtest page → Risk rules) is the refinement supported by the evidence. Volatility is predictable even when direction is not.
 3. **No confidence-based sizing or stop-loss tuning was added.** Tuning these on a random signal would only fit noise.
-4. **Ideas not yet tried**, which need other data sources:
-   - Crypto funding rates and open interest
+4. **Tried in round 2 with no direction edge:** funding rates, Fear & Greed, earnings surprises, analyst actions, yield curve and credit spreads.
+5. **Ideas not yet tried:**
+   - A much bigger universe (100+ stocks, 50+ coins)
+   - Open interest and liquidations (no free long history from this region)
    - On-chain flows
    - Order-book data
-   - News or sentiment
+   - News sentiment
    - Intraday data
-   - For stocks: earnings dates, analyst revisions, valuation
+   - Company fundamentals from SEC EDGAR (needs a contact email in requests)
+
+## Round 2: non-price data
+
+Loaded by `src/alt_data.py` from free sources and cached in `data/alt/`. Binance and Bybit block this region, so Hyperliquid and Deribit supply the funding rates.
+
+| Data | Source | History | Feature set |
+|---|---|---|---|
+| Fear & Greed index, BTC funding rate | alternative.me, Deribit | 2018 / 2019+ | crypto `+sentiment` |
+| Per-coin funding rate, all 10 coins | Hyperliquid | May 2023+ | crypto `+funding` |
+| Yield curve (10y-2y), corporate credit spread | FRED | decades | stock `+macro` |
+| Earnings surprise, days since earnings, analyst upgrades/downgrades and price-target changes | yfinance | 2005+ / 2012+ | stock `+events` (7 companies; ETFs have none) |
+
+Each value is only used once it was public: funding and Fear & Greed from the end of their day, earnings and analyst actions and FRED data from the next day.
+
+Per-coin funding only goes back to mid-2023, so it was tested in a separate **2023+ window** where `+cross`, `+sentiment` and `+funding` are compared on the same dates (6 test periods of about 4 months).
+
+| Question | Before (`+cross`) | With new data | Verdict |
+|---|---|---|---|
+| Crypto up/down in 5 days | 0.51 | 0.51 (`+sentiment`), 0.52 (`+funding`, 2023+) | No change |
+| Crypto beat the other coins | 0.53 | 0.53–0.54 (`+sentiment`); 2023+: 0.566 → 0.563 with funding | No change |
+| Crypto big move | 0.55 | 0.55–0.56 (`+sentiment`) | Slightly better |
+| Stock up/down in 5 days | 0.51 | 0.51 (`+macro`, `+events`) | No change |
+| Stock up/down in 20 days | 0.53 (logreg) | **0.56** (`+macro` logreg, all 6 periods), 0.55 (`+events`) | Lead, not a signal (see below) |
+| Stock beat the other stocks | 0.51 | 0.51–0.52 | No change |
+| Stock big move | 0.58 | **0.60** (`+events`, all 6 periods) | Better: earnings dates predict volatility |
+
+Rules on the new data alone, no ML:
+- **High funding → weaker returns** (crowded longs): ROC-AUC 0.45–0.51. No signal.
+- **Post-earnings drift** (buy after a beat): 0.48–0.50. No signal, which matches published research that the effect is weak in mega-cap stocks.
+
+Why the stock 20-day result is a lead and not a signal:
+- Only logistic regression finds it. Gradient boosting and random forest on the same features score 0.48–0.50.
+- 10 large US stocks and ETFs mostly move together, so the 6 test periods hold only about 6 independent bets on "will the market rise over the next month".
+- Its top-vs-bottom spread is about +1% per 20 days, small next to the noise.
+- It was found among 172 experiments.
+
+Testing it properly needs a much bigger stock universe (for example 100+ S&P 500 stocks) so the market-direction effect can be separated from stock picking.
+
+The 2023+ crypto window shows 20-day direction at 0.63 with `+cross` alone. That window is one strong crypto bull market, so this most likely reflects "trend kept going" in that regime. Adding funding made it worse (0.58).
 
 ## Caveat on multiple testing
 
-Testing 104 combinations means a few will look good by chance. That's why results are judged by consistency across all 6 test periods and across models, not by the single best score. The 20-day crypto result (best 0.552, 5 of 6 periods) is exactly the kind of lone good number that should not be trusted without new data.
+Testing 172 combinations means a few will look good by chance. That's why results are judged by consistency across all 6 test periods and across models, not by the single best score. The 20-day crypto result (best 0.552, 5 of 6 periods) is exactly the kind of lone good number that should not be trusted without new data.

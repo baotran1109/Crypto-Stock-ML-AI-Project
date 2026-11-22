@@ -39,6 +39,7 @@ from sklearn.metrics import roc_auc_score
 from sklearn.pipeline import make_pipeline
 from sklearn.preprocessing import StandardScaler
 
+from src import alt_data
 from src.data_loader import load_crypto
 from src.features import FEATURE_COLS, add_indicators
 from src.model_registry import TRAINING_UNIVERSES
@@ -63,19 +64,43 @@ CROSS = {
 XS = ["xs_ret5", "xs_ret20", "xs_ret60"]
 CALENDAR = ["dow"]
 
+# Non-price data (src/alt_data.py)
+CRYPTO_SENTIMENT = ["fng", "fng_chg7", "btc_fund7", "btc_fund_z90"]      # 2018/2019+
+CRYPTO_FUNDING = ["fund1", "fund7", "fund_z90", "xs_fund7"]               # per coin, May 2023+
+STOCK_MACRO = ["curve_10y2y", "curve_10y2y_chg20", "baa_spread", "baa_spread_chg20"]
+STOCK_EVENTS = ["eps_surprise", "eps_surprise_prev", "days_since_earn", "analyst_net30", "analyst_net90"]
+
+# Crypto per-coin funding only exists from mid-2023, so it gets its own shorter test window
+# where every feature set is compared on exactly the same dates.
+FUNDING_WINDOW_START = "2023-06-01"
+
 
 def feature_sets(asset_class: str) -> Dict[str, List[str]]:
     base = list(FEATURE_COLS)
     price = base + PRICE_EXTRA
     volume = price + VOLUME
     cross = volume + CROSS[asset_class]
-    return {
+    sets = {
         "base": base,
         "+price": price,
         "+volume": volume,
         "+cross": cross,
         "all": cross + XS + CALENDAR,
     }
+    if asset_class == "crypto":
+        sets["+sentiment"] = cross + CRYPTO_SENTIMENT
+        sets["+funding"] = cross + CRYPTO_SENTIMENT + CRYPTO_FUNDING
+    else:
+        sets["+macro"] = cross + STOCK_MACRO
+        sets["+events"] = cross + STOCK_MACRO + STOCK_EVENTS
+    return sets
+
+
+# Extra no-ML rules built on the new data: (name, column, sign). Score = sign * column.
+ALT_RULES = {
+    "crypto": [("rule_funding", "fund_z90", -1)],   # crowded longs (high funding) -> expect weaker returns
+    "stock": [("rule_eps", "eps_surprise", 1)],      # post-earnings drift
+}
 
 
 # target name -> (label column, horizon bars, outcome column used for the spread)
@@ -158,6 +183,16 @@ def asset_frame(symbol: str) -> pd.DataFrame:
     f["y_dir5"] = np.where(f["fwd5"].notna(), (f["fwd5"] > 0).astype(float), np.nan)
     f["y_dir20"] = np.where(f["fwd20"].notna(), (f["fwd20"] > 0).astype(float), np.nan)
 
+    # non-price data, aligned to this symbol's bar dates (strictly known by the bar's close)
+    if symbol.endswith("-USD"):
+        alt = alt_data.coin_funding_features(symbol.split("-")[0], df.index)
+        for col in ["fund1", "fund7", "fund_z90"]:
+            f[col] = alt[col] if col in alt else np.nan
+    else:
+        alt = alt_data.stock_event_features(symbol, df.index)
+        for col in STOCK_EVENTS:
+            f[col] = alt[col] if col in alt else np.nan
+
     f["symbol"] = symbol
     f["date"] = f.index
     return f.reset_index(drop=True)
@@ -177,6 +212,10 @@ def build_panel(asset_class: str, context: pd.DataFrame) -> pd.DataFrame:
     ctx = context.reindex(context.index.union(panel["date"].unique())).sort_index().ffill()
     ctx = ctx.loc[~ctx.index.duplicated()]
     panel = panel.join(ctx, on="date")
+    dates = pd.DatetimeIndex(np.sort(panel["date"].unique()))
+    market = (alt_data.crypto_market_features(dates) if asset_class == "crypto"
+              else alt_data.stock_macro_features(dates))
+    panel = panel.join(market, on="date")
     if asset_class == "crypto":
         panel["rel20_btc"] = panel["ret20"] - panel["btc_ret20"]
     else:
@@ -187,6 +226,9 @@ def build_panel(asset_class: str, context: pd.DataFrame) -> pd.DataFrame:
     count = g["close_ema12"].transform("count")
     for col, src in [("xs_ret5", "ret5"), ("xs_ret20", "ret20"), ("xs_ret60", "ret60")]:
         panel[col] = g[src].rank(pct=True).where(count >= MIN_XS_SYMBOLS)
+    if asset_class == "crypto":
+        fcount = g["fund7"].transform("count")
+        panel["xs_fund7"] = g["fund7"].rank(pct=True).where(fcount >= MIN_XS_SYMBOLS)
     med_fwd5 = g["fwd5"].transform("median")
     panel["excess5"] = panel["fwd5"] - med_fwd5
     panel["y_excess5"] = np.where(panel["fwd5"].notna() & (count >= MIN_XS_SYMBOLS),
@@ -214,7 +256,18 @@ def make_model(name: str):
     raise ValueError(name)
 
 
-def rule_score(df: pd.DataFrame, target: str) -> np.ndarray:
+def _alt_rule(rule: str):
+    for ac_rules in ALT_RULES.values():
+        for name, col, sign in ac_rules:
+            if rule == name:
+                return col, sign
+    return None
+
+
+def rule_score(df: pd.DataFrame, target: str, rule: str = "rule") -> np.ndarray:
+    alt = _alt_rule(rule)
+    if alt:
+        return alt[1] * df[alt[0]].values
     return (df["vol20"] if target == "bigmove5" else df["ret20"]).values
 
 
@@ -238,8 +291,8 @@ def walk_forward(panel: pd.DataFrame, target: str, features: List[str], model_na
         if len(tr) < 500 or te[ycol].nunique() < 2:
             continue
 
-        if model_name == "rule":
-            score = rule_score(te, target)
+        if model_name.startswith("rule"):
+            score = rule_score(te, target, model_name)
             ok = ~np.isnan(score)
             te, score = te[ok], score[ok]
         else:
@@ -278,14 +331,18 @@ def run(models: List[str], classes: List[str], rotation: bool = True):
         panel = build_panel(ac, context)
         print(f"   panel: {len(panel)} rows, {panel['symbol'].nunique()} symbols")
         fsets = feature_sets(ac)
+        if ac == "crypto":
+            fsets.pop("+funding")  # per-coin funding is tested in the funding window below
         for target in TARGETS:
-            res = walk_forward(panel, target, [], "rule")
-            rows.append({"asset_class": ac, "target": target, "features": "-", "model": "rule", **res})
-            print(f"   {ac:6s} {target:8s} {'-':8s} {'rule':6s} auc={res['mean_auc']:.3f} "
-                  f"min={res['min_auc']:.3f} folds>.5={res['folds_above_50']}/{res['n_folds']}")
+            rules = ["rule"] + ([r[0] for r in ALT_RULES["stock"]] if ac == "stock" else [])
+            for rule in rules:
+                res = walk_forward(panel, target, [], rule)
+                rows.append({"asset_class": ac, "target": target, "features": "-", "model": rule, **res})
+                print(f"   {ac:6s} {target:8s} {'-':8s} {rule:6s} auc={res['mean_auc']:.3f} "
+                      f"min={res['min_auc']:.3f} folds>.5={res['folds_above_50']}/{res['n_folds']}")
             for fs_name, cols in fsets.items():
                 for mname in models:
-                    if mname == "rf" and fs_name not in ("base", "all"):
+                    if mname == "rf" and fs_name not in ("base", "all", "+sentiment", "+events"):
                         continue  # RF is slow: only run it on the two ends of the ladder
                     t0 = time.time()
                     res = walk_forward(panel, target, cols, mname)
@@ -294,10 +351,35 @@ def run(models: List[str], classes: List[str], rotation: bool = True):
                     print(f"   {ac:6s} {target:8s} {fs_name:8s} {mname:6s} auc={res['mean_auc']:.3f} "
                           f"min={res['min_auc']:.3f} folds>.5={res['folds_above_50']}/{res['n_folds']} "
                           f"spread={res['mean_spread']:+.4f} ({time.time() - t0:.0f}s)")
+        if ac == "crypto":
+            rows += run_funding_window(panel, models)
         if rotation and ac == "crypto":
             print("\n[ROTATION] crypto")
             rotation_df = run_rotation(panel, ac)
     return pd.DataFrame(rows), rotation_df
+
+
+def run_funding_window(panel: pd.DataFrame, models: List[str]) -> List[Dict]:
+    """Compare feature sets on the dates where per-coin funding data exists (mid-2023+)."""
+    win = panel[panel["date"] >= FUNDING_WINDOW_START]
+    print(f"[FUNDING WINDOW] crypto {win['date'].min().date()} -> {win['date'].max().date()}, {len(win)} rows")
+    fsets = feature_sets("crypto")
+    rows = []
+    for target in TARGETS:
+        for rule in ["rule"] + [r[0] for r in ALT_RULES["crypto"]]:
+            res = walk_forward(win, target, [], rule)
+            rows.append({"asset_class": "crypto (2023+)", "target": target, "features": "-", "model": rule, **res})
+            print(f"   window {target:8s} {'-':10s} {rule:12s} auc={res['mean_auc']:.3f} "
+                  f"min={res['min_auc']:.3f} folds>.5={res['folds_above_50']}/{res['n_folds']}")
+        for fs_name in ["+cross", "+sentiment", "+funding"]:
+            for mname in [m for m in models if m != "rf"]:
+                res = walk_forward(win, target, fsets[fs_name], mname)
+                rows.append({"asset_class": "crypto (2023+)", "target": target, "features": fs_name,
+                             "model": mname, **res})
+                print(f"   window {target:8s} {fs_name:10s} {mname:12s} auc={res['mean_auc']:.3f} "
+                      f"min={res['min_auc']:.3f} folds>.5={res['folds_above_50']}/{res['n_folds']} "
+                      f"spread={res['mean_spread']:+.4f}")
+    return rows
 
 
 # ==========================================================

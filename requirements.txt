@@ -8,5 +8,6 @@ requests>=2.31.0
 urllib3>=2.0.0
 plotly>=5.17.0
 backtrader>=1.9.78
+lxml>=5.0.0
 
 
