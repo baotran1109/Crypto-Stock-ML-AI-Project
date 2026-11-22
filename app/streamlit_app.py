@@ -375,8 +375,20 @@ elif page == "Backtest":
                             line=dict(color='gray', width=2, dash='dash')
                         ))
 
+                    # Other rule-based benchmarks (click legend entries to toggle)
+                    bench_colors = ['#2ca02c', '#ff7f0e', '#9467bd', '#8c564b']
+                    others = [b for b in results.get('benchmarks', []) if b['name'] != 'Buy & hold']
+                    for b, color in zip(others, bench_colors):
+                        fig.add_trace(go.Scatter(
+                            x=equity_df.index,
+                            y=b['equity_curve'][:len(equity_df)],
+                            mode='lines',
+                            name=b['name'],
+                            line=dict(color=color, width=1.5, dash='dot')
+                        ))
+
                     fig.update_layout(
-                        title="Equity Curve vs Buy & Hold",
+                        title="Equity Curve vs Benchmarks",
                         xaxis_title="Date",
                         yaxis_title="Portfolio Value ($)",
                         height=400,
@@ -384,6 +396,52 @@ elif page == "Backtest":
                         hovermode='x unified'
                     )
                     st.plotly_chart(fig)
+
+                # Benchmark comparison
+                if results.get('benchmarks'):
+                    st.subheader("🏁 ML Model vs Benchmarks")
+                    st.caption("Every strategy runs through the same engine, window, capital and commission. "
+                               "If the ML model can't beat these simple rules, it isn't adding value.")
+                    rows = [results['ml_summary']] + results['benchmarks']
+                    comp = pd.DataFrame([{
+                        'Strategy': r['name'],
+                        'Total Return': r['total_return'],
+                        'Sharpe': r['sharpe_ratio'],
+                        'Max Drawdown': r['max_drawdown'],
+                        'Trades': r['total_trades'],
+                        'Win Rate': r['win_rate'],
+                        'Time in Market': r['time_in_market'],
+                        'Rule': r.get('rule', 'Buy/sell on model confidence thresholds.'),
+                    } for r in rows]).set_index('Strategy')
+                    st.dataframe(
+                        comp.style.format({
+                            'Total Return': '{:+.2%}', 'Sharpe': '{:+.2f}', 'Max Drawdown': '{:.2%}',
+                            'Win Rate': '{:.0%}', 'Time in Market': '{:.0%}',
+                        }).highlight_max(subset=['Total Return', 'Sharpe'], color='#d4edda'),
+                        width="stretch",
+                    )
+                    beaten = [b['name'] for b in results['benchmarks']
+                              if results['ml_summary']['total_return'] > b['total_return']]
+                    st.write(f"ML model beat **{len(beaten)} of {len(results['benchmarks'])}** benchmarks on total return"
+                             + (f" ({', '.join(beaten)})." if beaten else "."))
+
+                shuffle = results.get('shuffle_test')
+                if shuffle:
+                    st.subheader("🎲 Shuffle Test")
+                    st.caption(f"The ML model's own buy/sell/hold signals were randomly reordered {shuffle['n']} times: "
+                               "same number of trades, random timing. A model with real skill should beat most of them.")
+                    col1, col2, col3 = st.columns(3)
+                    col1.metric("ML Model Return", f"{results['total_return']:+.2%}")
+                    col2.metric("Median Shuffled Return", f"{shuffle['median_return']:+.2%}",
+                                help=f"10th-90th percentile: {shuffle['p10_return']:+.2%} to {shuffle['p90_return']:+.2%}")
+                    col3.metric("ML Beats Shuffles", f"{shuffle['ml_beats_pct']:.0%}")
+                    if shuffle['ml_beats_pct'] >= 0.9 and results.get('in_sample_overlap'):
+                        st.warning("The model's timing beats random timing here, but this window overlaps the "
+                                   "training data, so that is expected and not evidence of skill.")
+                    elif shuffle['ml_beats_pct'] >= 0.9:
+                        st.success("The model's timing beats random timing in this window.")
+                    else:
+                        st.info("The model's timing is not clearly better than random timing in this window.")
 
                 # Trade Details
                 if results.get('trades') and len(results['trades']) > 0:
