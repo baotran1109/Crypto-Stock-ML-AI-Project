@@ -7,60 +7,43 @@ import sys, os
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
 import streamlit as st
-import joblib
 import pandas as pd
 import numpy as np
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 from src.data_loader import load_crypto
 from src.features import add_indicators
-from src.backtest import run_backtest, load_training_metadata
+from src.backtest import run_backtest
+from src.model_registry import ASSET_CLASS_LABELS, TRAINING_UNIVERSES, asset_class_for, load_artifacts
 
 st.set_page_config(page_title="Crypto/Stock Machine Learning Predictor", page_icon="🪙", layout="wide")
 st.title("Crypto/Stock Machine Learning Predictor 🪙")
 
 # Sidebar for navigation
-page = st.sidebar.selectbox("Choose a page", ["Prediction", "Model Performance", "Backtest"])
+page = st.sidebar.selectbox("Choose a page", ["Prediction", "Model Performance", "Backtest", "Research"])
 
-# Load model and metadata (cache for performance)
+# One model per asset class: crypto and stocks are trained separately (cached for performance)
 @st.cache_resource
-def load_model_artifacts():
-    try:
-        model = joblib.load("artifacts/general_crypto_model.pkl")
-        cols = joblib.load("artifacts/feature_columns.pkl")
-        eval_metrics = None
-        feature_importance = None
+def load_all_models():
+    return {ac: load_artifacts(ac) for ac in TRAINING_UNIVERSES}
 
-        try:
-            eval_metrics = joblib.load("artifacts/evaluation_metrics.pkl")
-        except FileNotFoundError:
-            pass
+bundles = load_all_models()
 
-        try:
-            feature_importance = joblib.load("artifacts/feature_importance.pkl")
-        except FileNotFoundError:
-            pass
-
-        return model, cols, eval_metrics, feature_importance
-    except FileNotFoundError as e:
-        return None, None, None, None
-
-model, cols, eval_metrics, feature_importance = load_model_artifacts()
-training_meta = load_training_metadata()
-
-if model is None:
+if not any(bundles.values()):
     st.error("❌ Model files not found. Run `python -m src.train_model` first.")
     st.stop()
 
-if training_meta is None:
-    st.warning("⚠️ These model files are from an older version of the project. "
-               "Run `python -m src.train_model` to retrain before using the app.")
-else:
-    st.sidebar.caption(
-        f"Model trained on {', '.join(training_meta['symbols'])}\n\n"
-        f"Train: {training_meta['train_start']} → {training_meta['train_end']}\n\n"
-        f"Test: {training_meta['test_start']} → {training_meta['test_end']}"
-    )
+st.sidebar.markdown("**Models**")
+for ac, b in bundles.items():
+    label = ASSET_CLASS_LABELS[ac]
+    if b is None:
+        st.sidebar.caption(f"{label}: not trained. Run `python -m src.train_model --classes {ac}`.")
+    elif b.get("metadata"):
+        m = b["metadata"]
+        st.sidebar.caption(
+            f"**{label}** model: {', '.join(m['symbols'])}\n\n"
+            f"Train {m['train_start']} → {m['train_end']} · Test {m['test_start']} → {m['test_end']}"
+        )
 
 # ==========================================================
 # PREDICTION PAGE
@@ -75,6 +58,13 @@ if page == "Prediction":
         chart_days = st.slider("Chart Days", 30, 500, 300)
 
     if st.button("Predict", type="primary"):
+        asset_class = asset_class_for(symbol)
+        bundle = bundles.get(asset_class)
+        if bundle is None:
+            st.error(f"No {ASSET_CLASS_LABELS[asset_class].lower()} model trained. "
+                     f"Run `python -m src.train_model --classes {asset_class}`.")
+            st.stop()
+        model, cols, training_meta = bundle["model"], bundle["feature_cols"], bundle["metadata"]
         with st.spinner(f"Fetching {symbol} data..."):
             try:
                 df = add_indicators(load_crypto(symbol, force_refresh=False))
@@ -99,10 +89,12 @@ if page == "Prediction":
                     prob = model.predict_proba(X)[0, 1]
                     pred = int(prob > 0.5)
                     horizon = training_meta.get("horizon", 5) if training_meta else 5
-                    st.caption(f"Prediction for {horizon} bars after the {X.index[-1].date()} close.")
+                    st.caption(f"Using the **{ASSET_CLASS_LABELS[asset_class].lower()} model**. "
+                               f"Prediction for {horizon} bars after the {X.index[-1].date()} close.")
                     if training_meta and symbol.upper() not in [s.upper() for s in training_meta["symbols"]]:
-                        st.info(f"ℹ️ {symbol.upper()} was not in the training set ({', '.join(training_meta['symbols'])}). "
-                                "The features are scale-free so the model still applies, but treat it as an out-of-domain guess.")
+                        st.info(f"ℹ️ {symbol.upper()} was not one of the symbols this model was trained on "
+                                f"({', '.join(training_meta['symbols'])}). It is the same asset class, so the model "
+                                "applies, but it has never seen this symbol's own history.")
                     
                     # Display prediction
                     col1, col2, col3 = st.columns(3)
@@ -172,6 +164,13 @@ if page == "Prediction":
 # ==========================================================
 elif page == "Model Performance":
     st.header("📊 Model Performance Metrics")
+    available = [ac for ac, b in bundles.items() if b is not None]
+    perf_class = st.radio("Model", available, format_func=lambda ac: ASSET_CLASS_LABELS[ac], horizontal=True)
+    bundle = bundles[perf_class]
+    eval_metrics, feature_importance, training_meta = bundle["metrics"], bundle["importance"], bundle["metadata"]
+    if training_meta:
+        st.caption(f"Trained on {', '.join(training_meta['symbols'])}. "
+                   f"Target: is the close {training_meta.get('horizon', 5)} bars ahead higher than today's close?")
 
     if eval_metrics:
         col1, col2, col3, col4 = st.columns(4)
@@ -284,6 +283,19 @@ elif page == "Backtest":
     out_of_sample = st.checkbox(
         "Out-of-sample only (after the model's training period)", value=True,
         help="Unticking this lets the backtest include dates the model was trained on, which inflates results.")
+
+    with st.expander("⚙️ Risk rules (applied to the ML model and every benchmark)"):
+        col1, col2, col3 = st.columns(3)
+        with col1:
+            use_vol_target = st.checkbox("Volatility-based sizing", value=False,
+                                         help="Invest less when the market is volatile: position = target vol / current vol, capped at 100%.")
+            vol_target_pct = st.slider("Target volatility (annual %)", 5, 100, 40, 5, disabled=not use_vol_target)
+        with col2:
+            min_hold = st.number_input("Minimum holding period (bars)", 0, 60, 0, 1,
+                                       help="Ignore exit signals until a position has been held this long. Cuts back-and-forth trading.")
+        with col3:
+            slippage_pct = st.number_input("Slippage per side (%)", 0.0, 1.0, 0.05, 0.01,
+                                           help="Extra cost per trade on top of commission, for fills worse than the close.")
     
     if st.button("Run Backtest", type="primary"):
         with st.spinner("Running backtest... This may take a minute."):
@@ -294,6 +306,9 @@ elif page == "Backtest":
                 commission=commission,
                 lookback=lookback_years,
                 out_of_sample=out_of_sample,
+                vol_target=vol_target_pct / 100 if use_vol_target else None,
+                min_hold=int(min_hold),
+                slippage=slippage_pct / 100,
             )
 
             if "error" in results:
@@ -327,7 +342,8 @@ elif page == "Backtest":
             else:
                 # Key Metrics
                 st.subheader("📈 Backtest Results")
-                st.caption(f"Period: {results['period_start']} → {results['period_end']} · "
+                st.caption(f"{ASSET_CLASS_LABELS[results['asset_class']]} model · "
+                           f"Period: {results['period_start']} → {results['period_end']} · "
                            f"buy if P(up) > {results['buy_threshold']:.3f}, exit if P(up) < {results['sell_threshold']:.3f}")
                 if results.get('in_sample_overlap'):
                     st.warning("⚠️ This period overlaps the data the model was trained on for this symbol, "
@@ -411,12 +427,13 @@ elif page == "Backtest":
                         'Trades': r['total_trades'],
                         'Win Rate': r['win_rate'],
                         'Time in Market': r['time_in_market'],
+                        'Avg Exposure': r.get('avg_exposure', r['time_in_market']),
                         'Rule': r.get('rule', 'Buy/sell on model confidence thresholds.'),
                     } for r in rows]).set_index('Strategy')
                     st.dataframe(
                         comp.style.format({
                             'Total Return': '{:+.2%}', 'Sharpe': '{:+.2f}', 'Max Drawdown': '{:.2%}',
-                            'Win Rate': '{:.0%}', 'Time in Market': '{:.0%}',
+                            'Win Rate': '{:.0%}', 'Time in Market': '{:.0%}', 'Avg Exposure': '{:.0%}',
                         }).highlight_max(subset=['Total Return', 'Sharpe'], color='#d4edda'),
                         width="stretch",
                     )
@@ -475,3 +492,18 @@ elif page == "Backtest":
                         st.metric("Profit Factor", f"{results['profit_factor']:.2f}")
                         st.metric("Prediction Accuracy", f"{results['prediction_accuracy']:.2%}")
 
+# ==========================================================
+# RESEARCH PAGE
+# ==========================================================
+elif page == "Research":
+    st.header("🔬 Signal Research")
+    st.caption("Results of `python -m src.research`: many target / feature / model combinations scored "
+               "walk-forward on data each model never saw. Re-run that command to refresh this page.")
+    for name, label in [("FINDINGS.md", "Findings"), ("signal_research.md", "Full results")]:
+        path = os.path.join("reports", name)
+        if os.path.exists(path):
+            with st.expander(label, expanded=(name == "FINDINGS.md")):
+                with open(path, encoding="utf-8") as fh:
+                    st.markdown(fh.read())
+    if not os.path.exists(os.path.join("reports", "signal_research.md")):
+        st.info("No research results yet. Run `python -m src.research` from the project root.")

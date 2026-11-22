@@ -14,6 +14,9 @@ Key points
   (out_of_sample=True), so results are not inflated by data the model has seen.
 - Orders fill at the close of the signal bar (signals only use data up to that close),
   and position size is fractional, so expensive assets like BTC trade with small capital.
+- Optional risk rules, applied identically to every strategy: volatility-based sizing
+  (position = vol_target / current annualised vol, capped at 100%), a minimum holding
+  period before exits are honoured, and slippage as an extra cost per side.
 - Shuffle test: the ML signals are randomly permuted many times (same number of buy/sell/
   hold days, random timing). If the model beats most shuffles, its timing adds value.
 """
@@ -21,24 +24,16 @@ Key points
 from typing import Dict, List, Optional
 
 import backtrader as bt
-import joblib
 import numpy as np
 import pandas as pd
 
 from src.data_loader import load_crypto, DataLoadError
 from src.features import HORIZON, add_indicators
+from src.model_registry import ASSET_CLASS_LABELS, asset_class_for, load_artifacts
 
-METADATA_PATH = "artifacts/training_metadata.pkl"
 ML_NAME = "ML model"
 N_SHUFFLES = 20
 SHUFFLE_SEED = 42
-
-
-def load_training_metadata(path: str = METADATA_PATH) -> Optional[dict]:
-    try:
-        return joblib.load(path)
-    except (FileNotFoundError, OSError):
-        return None
 
 
 def _thresholds(confidence_threshold: float):
@@ -102,7 +97,11 @@ class SignalStrategy(bt.Strategy):
         ("signals", None),      # np.ndarray aligned 1:1 with the data feed
         ("confidence", None),   # optional np.ndarray (ML probabilities) stored on trades
         ("closes", None),       # np.ndarray of closes, for the horizon-ahead check
-        ("commission", 0.001),
+        ("vols", None),         # np.ndarray of trailing daily return std (for vol targeting)
+        ("cost", 0.001),        # commission + slippage per side, as a fraction
+        ("vol_target", None),   # annualised volatility target, e.g. 0.20; None = always fully invested
+        ("periods_per_year", 365),
+        ("min_hold", 0),        # bars to hold before an exit signal is honoured
     )
 
     def __init__(self):
@@ -110,24 +109,39 @@ class SignalStrategy(bt.Strategy):
         self.entry = None
         self.equity_curve, self.equity_dates = [], []
         self.bars_in_market = 0
+        self.exposure_sum = 0.0  # sum of position fraction per bar (for average exposure)
+
+    def _position_fraction(self, i: int) -> float:
+        """Fraction of equity to invest. With vol targeting: target / current annualised vol, capped at 1."""
+        p = self.params
+        if p.vol_target is None or p.vols is None:
+            return 1.0
+        daily = p.vols[i]
+        if not np.isfinite(daily) or daily <= 0:
+            return 1.0
+        return float(min(1.0, p.vol_target / (daily * np.sqrt(p.periods_per_year))))
 
     def next(self):
         i = len(self) - 1
         sig = self.params.signals[i]
 
-        if sig == 1 and not self.position:
+        if sig == 1 and not self.position and self.entry is None:
             price = self.data.close[0]
-            size = self.broker.getcash() / (price * (1 + self.params.commission)) * 0.999
+            frac = self._position_fraction(i)
+            size = self.broker.getvalue() * frac / (price * (1 + self.params.cost)) * 0.999
             if size > 0:
                 self.buy(size=size)
                 conf = self.params.confidence[i] if self.params.confidence is not None else np.nan
-                self.entry = {"idx": i, "date": self.data.datetime.date(0), "price": price, "prob": conf}
-        elif sig == 0 and self.position:
-            self.close()
-            self._record_exit(self.data.close[0], self.data.datetime.date(0))
+                self.entry = {"idx": i, "date": self.data.datetime.date(0), "price": price,
+                              "prob": conf, "fraction": frac}
+        elif sig == 0 and self.position and self.entry is not None:
+            if i - self.entry["idx"] >= self.params.min_hold:
+                self.close()
+                self._record_exit(self.data.close[0], self.data.datetime.date(0))
 
         if self.entry is not None:  # long from the entry bar's close up to the exit bar
             self.bars_in_market += 1
+            self.exposure_sum += self.entry["fraction"]
         # Value at this bar's close (orders placed now fill at this close on the next broker tick)
         self.equity_curve.append(self.broker.getvalue())
         self.equity_dates.append(self.data.datetime.date(0))
@@ -150,6 +164,7 @@ class SignalStrategy(bt.Strategy):
             "actual_direction": actual_up,
             "correct": actual_up,            # was price higher HORIZON bars after entry?
             "confidence": e["prob"],
+            "position_fraction": e["fraction"],
             "open_at_end": False,
         })
         self.entry = None
@@ -161,7 +176,13 @@ class SignalStrategy(bt.Strategy):
 
 
 def _run_engine(df_bt: pd.DataFrame, signals: np.ndarray, initial_capital: float,
-                commission: float, confidence: Optional[np.ndarray] = None) -> SignalStrategy:
+                risk: Dict, confidence: Optional[np.ndarray] = None) -> SignalStrategy:
+    """
+    risk: {"commission", "slippage", "vol_target", "min_hold", "periods_per_year", "vols"}
+    The same risk rules are applied to every strategy so comparisons stay fair.
+    Slippage is modelled as an extra cost per side on top of commission.
+    """
+    cost = risk["commission"] + risk.get("slippage", 0.0)
     cerebro = bt.Cerebro(stdstats=False)
     cerebro.adddata(bt.feeds.PandasData(dataname=df_bt, openinterest=-1))
     cerebro.addstrategy(
@@ -169,10 +190,14 @@ def _run_engine(df_bt: pd.DataFrame, signals: np.ndarray, initial_capital: float
         signals=np.asarray(signals),
         confidence=confidence,
         closes=df_bt["close"].values,
-        commission=commission,
+        vols=risk.get("vols"),
+        cost=cost,
+        vol_target=risk.get("vol_target"),
+        periods_per_year=risk.get("periods_per_year", 365),
+        min_hold=risk.get("min_hold", 0),
     )
     cerebro.broker.setcash(initial_capital)
-    cerebro.broker.setcommission(commission=commission)
+    cerebro.broker.setcommission(commission=cost)
     cerebro.broker.set_coc(True)  # fill market orders at the signal bar's close
     strat = cerebro.run()[0]
     strat.final_value = cerebro.broker.getvalue()
@@ -209,6 +234,7 @@ def _summarize(name: str, strat: SignalStrategy, initial_capital: float, periods
         "total_trades": n,
         "win_rate": len(wins) / n if n else 0.0,
         "time_in_market": strat.bars_in_market / max(len(equity), 1),
+        "avg_exposure": strat.exposure_sum / max(len(equity), 1),
         "equity_curve": equity.tolist(),
     }
 
@@ -218,8 +244,7 @@ def _summarize(name: str, strat: SignalStrategy, initial_capital: float, periods
 # ==========================================================
 def run_backtest(
     symbol: str,
-    model_path: str = "artifacts/general_crypto_model.pkl",
-    feature_cols_path: str = "artifacts/feature_columns.pkl",
+    asset_class: Optional[str] = None,
     lookback: str = "5y",
     initial_capital: float = 10000.0,
     commission: float = 0.001,
@@ -229,17 +254,21 @@ def run_backtest(
     out_of_sample: bool = True,
     include_benchmarks: bool = True,
     n_shuffles: int = N_SHUFFLES,
+    vol_target: Optional[float] = None,
+    min_hold: int = 0,
+    slippage: float = 0.0,
 ) -> Dict:
     """
     Run the ML backtest (and, by default, benchmarks + shuffle test).
     Returns a dict of metrics, trades and curves, or {"error": ...}.
     With out_of_sample=True the window starts after the model's training period.
     """
-    try:
-        model = joblib.load(model_path)
-        feature_cols = joblib.load(feature_cols_path)
-    except FileNotFoundError:
-        return {"error": "Model files not found. Run `python -m src.train_model` first."}
+    asset_class = asset_class or asset_class_for(symbol)
+    bundle = load_artifacts(asset_class)
+    if bundle is None:
+        return {"error": f"No {ASSET_CLASS_LABELS[asset_class].lower()} model found. "
+                         f"Run `python -m src.train_model` first."}
+    model, feature_cols, meta = bundle["model"], bundle["feature_cols"], bundle["metadata"]
 
     try:
         raw = load_crypto(symbol, lookback=lookback)
@@ -264,7 +293,6 @@ def run_backtest(
     bench_full = benchmark_signals(full) if include_benchmarks else {}
 
     # ---- choose the test window ----
-    meta = load_training_metadata()
     oos_start = None
     if out_of_sample and meta:
         oos_start = pd.Timestamp(meta["train_end"]) + pd.Timedelta(days=meta.get("horizon", HORIZON) + 1)
@@ -290,6 +318,14 @@ def run_backtest(
     df_bt = df[["open", "high", "low", "close", "volume"]].copy()
     df_bt["volume"] = df_bt["volume"].fillna(0)
     periods = 365 if symbol.upper().endswith("-USD") else 252
+    risk = {
+        "commission": commission,
+        "slippage": slippage,
+        "vol_target": vol_target,
+        "min_hold": int(min_hold),
+        "periods_per_year": periods,
+        "vols": df["vol20"].values,
+    }
 
     # ---- ML strategy ----
     feats = df[feature_cols]
@@ -301,7 +337,7 @@ def run_backtest(
     sig_ml = ml_signals(probs, buy_th, sell_th)
 
     try:
-        strat = _run_engine(df_bt, sig_ml, initial_capital, commission, confidence=probs)
+        strat = _run_engine(df_bt, sig_ml, initial_capital, risk, confidence=probs)
     except Exception as e:
         return {"error": f"Backtest execution failed: {e}"}
 
@@ -336,7 +372,7 @@ def run_backtest(
     # ---- benchmarks (same window, engine, capital, commission) ----
     benchmarks: List[Dict] = []
     for name, sig in bench_full.items():
-        b = _summarize(name, _run_engine(df_bt, sig.loc[df.index].values, initial_capital, commission),
+        b = _summarize(name, _run_engine(df_bt, sig.loc[df.index].values, initial_capital, risk),
                        initial_capital, periods)
         b["rule"] = BENCHMARK_RULES.get(name, "")
         benchmarks.append(b)
@@ -350,7 +386,7 @@ def run_backtest(
         for _ in range(n_shuffles):
             s = sig_ml.copy()
             s[valid] = rng.permutation(sig_valid)
-            st = _run_engine(df_bt, s, initial_capital, commission)
+            st = _run_engine(df_bt, s, initial_capital, risk)
             shuffled_returns.append(st.final_value / initial_capital - 1)
         shuffled_returns = np.array(shuffled_returns)
         shuffle = {
@@ -386,6 +422,9 @@ def run_backtest(
         "max_drawdown": ml_summary["max_drawdown"],
         "sharpe_ratio": ml_summary["sharpe_ratio"],
         "time_in_market": ml_summary["time_in_market"],
+        "avg_exposure": ml_summary["avg_exposure"],
+        "risk_settings": {"vol_target": vol_target, "min_hold": int(min_hold),
+                          "slippage": slippage, "commission": commission},
         "trades": trades_df.to_dict("records"),
         "equity_curve": equity.tolist(),
         "buy_hold_curve": buy_hold_curve,
@@ -393,6 +432,7 @@ def run_backtest(
         "period_start": dates[0],
         "period_end": dates[-1],
         "out_of_sample": oos_start is not None,
+        "asset_class": asset_class,
         "in_sample_overlap": in_sample_overlap,
         "buy_threshold": buy_th,
         "sell_threshold": sell_th,
