@@ -32,7 +32,9 @@ from src.features import HORIZON, add_indicators
 from src.model_registry import ASSET_CLASS_LABELS, asset_class_for, load_artifacts
 
 ML_NAME = "ML model"
-N_SHUFFLES = 20
+from src.config import BACKTEST
+
+N_SHUFFLES = BACKTEST["n_shuffles"]
 SHUFFLE_SEED = 42
 
 

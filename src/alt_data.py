@@ -254,3 +254,19 @@ def stock_macro_features(dates: pd.DatetimeIndex) -> pd.DataFrame:
         out[name] = _asof(v, dates)
         out[name + "_chg20"] = _asof(v - v.shift(20), dates)
     return out
+
+
+def next_earnings(symbol: str) -> Optional[pd.Timestamp]:
+    """Next scheduled earnings report (UTC, naive) for a stock, or None (ETFs, crypto, no data)."""
+    if symbol.upper().endswith("-USD"):
+        return None
+    try:
+        import yfinance as yf
+        e = yf.Ticker(symbol).get_earnings_dates(limit=8)
+    except Exception:
+        return None
+    if e is None or e.empty:
+        return None
+    idx = pd.DatetimeIndex(e.index).tz_convert("UTC").tz_localize(None)
+    future = idx[idx >= pd.Timestamp.utcnow().tz_localize(None).normalize()]
+    return future.min() if len(future) else None

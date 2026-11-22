@@ -42,13 +42,14 @@ from sklearn.preprocessing import StandardScaler
 from src import alt_data
 from src.data_loader import load_crypto
 from src.features import FEATURE_COLS, add_indicators
+from src.config import RESEARCH, UNIVERSES_LARGE
 from src.model_registry import TRAINING_UNIVERSES
 
 warnings.filterwarnings("ignore", category=RuntimeWarning)
 
-LOOKBACK = "10y"
-TEST_FRACTION = 0.6
-N_FOLDS = 6
+LOOKBACK = RESEARCH["lookback"]          # settings live in config.toml
+TEST_FRACTION = RESEARCH["test_fraction"]
+N_FOLDS = RESEARCH["n_folds"]
 MIN_XS_SYMBOLS = 4
 REPORT_DIR = "reports"
 
@@ -115,18 +116,21 @@ TARGETS = {
 # ==========================================================
 # DATA
 # ==========================================================
-def _load(symbol: str) -> pd.DataFrame:
+RESEARCH_FRESH_HOURS = 24 * 7  # research tolerates week-old caches; live prediction passes its own
+
+
+def _load(symbol: str, fresh_hours: float = RESEARCH_FRESH_HOURS) -> pd.DataFrame:
     try:
-        return load_crypto(symbol, lookback=LOOKBACK, prefer="yahoo", fresh_hours=24 * 7)
+        return load_crypto(symbol, lookback=LOOKBACK, prefer="yahoo", fresh_hours=fresh_hours)
     except Exception as e:
         print(f"   [WARN] {symbol}: {e}")
         return pd.DataFrame()
 
 
-def load_context() -> pd.DataFrame:
+def load_context(fresh_hours: float = RESEARCH_FRESH_HOURS) -> pd.DataFrame:
     closes = {}
     for name, sym in CONTEXT_SYMBOLS.items():
-        df = _load(sym)
+        df = _load(sym, fresh_hours)
         if not df.empty:
             closes[name] = df["close"]
     ctx = pd.DataFrame(closes).sort_index()
@@ -151,8 +155,12 @@ def load_context() -> pd.DataFrame:
     return out
 
 
-def asset_frame(symbol: str) -> pd.DataFrame:
-    raw = _load(symbol)
+FUNDING_FEATURES = True  # per-coin funding downloads; switched off for the large universe
+ROTATE_STOCKS = False    # stock rotation only makes sense with a large stock universe
+
+
+def asset_frame(symbol: str, fresh_hours: float = RESEARCH_FRESH_HOURS) -> pd.DataFrame:
+    raw = _load(symbol, fresh_hours)
     if raw.empty:
         return pd.DataFrame()
     df = add_indicators(raw)
@@ -178,6 +186,7 @@ def asset_frame(symbol: str) -> pd.DataFrame:
     f["fwd20"] = c.shift(-20) / c - 1
     f["absfwd5"] = f["fwd5"].abs()
     big_thr = (c / c.shift(5) - 1).abs().rolling(252, min_periods=60).median()  # known at t
+    f["move_thr"] = big_thr  # typical 5-day move size; a "big move" is one larger than this
     f["y_big5"] = np.where(f["fwd5"].notna() & big_thr.notna(),
                            (f["absfwd5"] > big_thr).astype(float), np.nan)
     f["y_dir5"] = np.where(f["fwd5"].notna(), (f["fwd5"] > 0).astype(float), np.nan)
@@ -185,7 +194,8 @@ def asset_frame(symbol: str) -> pd.DataFrame:
 
     # non-price data, aligned to this symbol's bar dates (strictly known by the bar's close)
     if symbol.endswith("-USD"):
-        alt = alt_data.coin_funding_features(symbol.split("-")[0], df.index)
+        alt = (alt_data.coin_funding_features(symbol.split("-")[0], df.index) if FUNDING_FEATURES
+               else pd.DataFrame(index=df.index))
         for col in ["fund1", "fund7", "fund_z90"]:
             f[col] = alt[col] if col in alt else np.nan
     else:
@@ -198,16 +208,8 @@ def asset_frame(symbol: str) -> pd.DataFrame:
     return f.reset_index(drop=True)
 
 
-def build_panel(asset_class: str, context: pd.DataFrame) -> pd.DataFrame:
-    frames = []
-    for sym in UNIVERSES[asset_class]:
-        f = asset_frame(sym)
-        if f.empty:
-            continue
-        print(f"   {sym:9s} {len(f):5d} rows  {f['date'].min().date()} -> {f['date'].max().date()}")
-        frames.append(f)
-    panel = pd.concat(frames, ignore_index=True)
-
+def attach_shared(panel: pd.DataFrame, asset_class: str, context: pd.DataFrame) -> pd.DataFrame:
+    """Add market-wide features (same value for every symbol on a date). Also used for live prediction."""
     # context features: last known value on or before each date (ffill = no look-ahead)
     ctx = context.reindex(context.index.union(panel["date"].unique())).sort_index().ffill()
     ctx = ctx.loc[~ctx.index.duplicated()]
@@ -220,6 +222,18 @@ def build_panel(asset_class: str, context: pd.DataFrame) -> pd.DataFrame:
         panel["rel20_btc"] = panel["ret20"] - panel["btc_ret20"]
     else:
         panel["rel20_spy"] = panel["ret20"] - panel["spy_ret20"]
+    return panel
+
+
+def build_panel(asset_class: str, context: pd.DataFrame) -> pd.DataFrame:
+    frames = []
+    for sym in UNIVERSES[asset_class]:
+        f = asset_frame(sym)
+        if f.empty:
+            continue
+        print(f"   {sym:9s} {len(f):5d} rows  {f['date'].min().date()} -> {f['date'].max().date()}")
+        frames.append(f)
+    panel = attach_shared(pd.concat(frames, ignore_index=True), asset_class, context)
 
     # cross-sectional: rank vs the other symbols on the same date
     g = panel.groupby("date")
@@ -351,11 +365,13 @@ def run(models: List[str], classes: List[str], rotation: bool = True):
                     print(f"   {ac:6s} {target:8s} {fs_name:8s} {mname:6s} auc={res['mean_auc']:.3f} "
                           f"min={res['min_auc']:.3f} folds>.5={res['folds_above_50']}/{res['n_folds']} "
                           f"spread={res['mean_spread']:+.4f} ({time.time() - t0:.0f}s)")
-        if ac == "crypto":
+        if ac == "crypto" and FUNDING_FEATURES:
             rows += run_funding_window(panel, models)
-        if rotation and ac == "crypto":
-            print("\n[ROTATION] crypto")
-            rotation_df = run_rotation(panel, ac)
+        if rotation and (ac == "crypto" or ROTATE_STOCKS):
+            print(f"[ROTATION] {ac}")
+            rot = run_rotation(panel, ac)
+            rot.insert(0, "asset_class", ac)
+            rotation_df = rot if rotation_df is None else pd.concat([rotation_df, rot], ignore_index=True)
     return pd.DataFrame(rows), rotation_df
 
 
@@ -526,18 +542,19 @@ def write_report(results: pd.DataFrame, rotation: Optional[pd.DataFrame] = None)
         lines.append("")
     if rotation is not None and len(rotation):
         rotation.to_csv(os.path.join(REPORT_DIR, "rotation_research.csv"), index=False)
-        lines += ["## crypto rotation (does the excess5 ranking make money after costs?)", "",
-                  f"Every `hold` bars, hold the top-k coins by predicted P(beat the median coin), equal weight. "
-                  f"Walk-forward, period {rotation['period'].iloc[0]}. Every configuration tried is listed.", "",
-                  "| config | ML total | ML Sharpe | ML max DD | momentum top-k | equal-weight basket | random top-k (median) | ML beats random |",
-                  "|---|---|---|---|---|---|---|---|"]
-        for _, r in rotation.iterrows():
-            lines.append(f"| {r['config']} | {r['ml_total']:+.1%} | {r['ml_sharpe']:+.2f} | {r['ml_mdd']:.0%} | "
-                         f"{r['momentum_total']:+.1%} | {r['basket_total']:+.1%} | {r['random_median_total']:+.1%} | "
-                         f"{r['ml_beats_random']:.0%} |")
-        n = len(rotation)
-        lines += ["", f"ML beat the equal-weight basket in {(rotation['ml_total'] > rotation['basket_total']).sum()}/{n} "
-                      f"configs and momentum in {(rotation['ml_total'] > rotation['momentum_total']).sum()}/{n}.", ""]
+        for ac, rot in rotation.groupby("asset_class", sort=False):
+            lines += [f"## {ac} rotation (does the excess5 ranking make money after costs?)", "",
+                      f"Every `hold` bars, hold the top-k symbols by predicted P(beat the median), equal weight. "
+                      f"Walk-forward, period {rot['period'].iloc[0]}. Every configuration tried is listed.", "",
+                      "| config | ML total | ML Sharpe | ML max DD | momentum top-k | equal-weight basket | random top-k (median) | ML beats random |",
+                      "|---|---|---|---|---|---|---|---|"]
+            for _, r in rot.iterrows():
+                lines.append(f"| {r['config']} | {r['ml_total']:+.1%} | {r['ml_sharpe']:+.2f} | {r['ml_mdd']:.0%} | "
+                             f"{r['momentum_total']:+.1%} | {r['basket_total']:+.1%} | {r['random_median_total']:+.1%} | "
+                             f"{r['ml_beats_random']:.0%} |")
+            n = len(rot)
+            lines += ["", f"ML beat the equal-weight basket in {(rot['ml_total'] > rot['basket_total']).sum()}/{n} "
+                          f"configs and momentum in {(rot['ml_total'] > rot['momentum_total']).sum()}/{n}.", ""]
     path = os.path.join(REPORT_DIR, "signal_research.md")
     with open(path, "w", encoding="utf-8") as fh:
         fh.write("\n".join(lines))
@@ -549,7 +566,15 @@ if __name__ == "__main__":
     ap.add_argument("--quick", action="store_true", help="logreg + hgb only")
     ap.add_argument("--classes", nargs="+", default=list(UNIVERSES))
     ap.add_argument("--no-rotation", action="store_true", help="skip the crypto rotation simulation")
+    ap.add_argument("--universe", choices=["default", "large"], default="default",
+                    help="large = ~100 stocks and ~40 coins from config.toml (no per-coin funding); "
+                         "reports go to reports/large/")
     args = ap.parse_args()
+    if args.universe == "large":
+        UNIVERSES = {ac: list(v) for ac, v in UNIVERSES_LARGE.items()}
+        FUNDING_FEATURES = False
+        ROTATE_STOCKS = True
+        REPORT_DIR = os.path.join(REPORT_DIR, "large")
     models = ["logreg", "hgb"] if args.quick else ["logreg", "hgb", "rf"]
     t0 = time.time()
     res, rot = run(models, args.classes, rotation=not args.no_rotation)

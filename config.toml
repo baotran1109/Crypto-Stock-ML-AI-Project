@@ -1,0 +1,47 @@
+# Project settings. Every script reads this file through src/config.py.
+# Change values here instead of editing constants in the code.
+
+[universes]
+# Symbols the production models are trained on (one model per asset class).
+crypto = ["BTC-USD", "ETH-USD", "SOL-USD", "XRP-USD", "ADA-USD",
+          "DOGE-USD", "LINK-USD", "LTC-USD", "BNB-USD", "AVAX-USD"]
+stock = ["AAPL", "MSFT", "GOOGL", "AMZN", "META", "NVDA", "TSLA", "SPY", "QQQ", "DIA"]
+
+[universes_large]
+# Bigger universes for research only (python -m src.research --universe large).
+crypto = ["BTC-USD", "ETH-USD", "SOL-USD", "XRP-USD", "ADA-USD", "DOGE-USD", "LINK-USD", "LTC-USD",
+          "BNB-USD", "AVAX-USD", "DOT-USD", "TRX-USD", "BCH-USD", "XLM-USD", "ATOM-USD", "ETC-USD",
+          "FIL-USD", "HBAR-USD", "ICP-USD", "NEAR-USD", "ALGO-USD", "VET-USD", "AAVE-USD", "XMR-USD",
+          "EOS-USD", "XTZ-USD", "SAND-USD", "MANA-USD", "AXS-USD", "THETA-USD", "ZEC-USD", "DASH-USD",
+          "NEO-USD", "BAT-USD", "CRO-USD", "COMP-USD", "SNX-USD", "KSM-USD", "CHZ-USD", "SHIB-USD"]
+# Large US companies (roughly the S&P 100). No ETFs, so every symbol has earnings data.
+stock = ["AAPL", "MSFT", "GOOGL", "AMZN", "META", "NVDA", "TSLA", "AVGO", "ORCL", "ADBE",
+         "CRM", "CSCO", "INTC", "AMD", "QCOM", "TXN", "IBM", "INTU", "AMAT", "MU",
+         "JPM", "BAC", "WFC", "C", "GS", "MS", "BLK", "SCHW", "AXP", "USB",
+         "V", "MA", "PYPL", "BRK-B", "COF", "MET", "AIG", "BK", "PNC", "TFC",
+         "UNH", "JNJ", "LLY", "PFE", "MRK", "ABBV", "TMO", "ABT", "DHR", "BMY",
+         "AMGN", "GILD", "CVS", "MDT", "ISRG", "WMT", "COST", "HD", "LOW", "TGT",
+         "PG", "KO", "PEP", "PM", "MO", "MDLZ", "CL", "MCD", "SBUX", "NKE",
+         "DIS", "NFLX", "CMCSA", "T", "VZ", "TMUS", "XOM", "CVX", "COP", "SLB",
+         "BA", "CAT", "DE", "GE", "HON", "LMT", "RTX", "UPS", "FDX", "MMM",
+         "UNP", "EMR", "GD", "NEE", "DUK", "SO", "LIN", "SPG", "AMT", "BKNG"]
+
+[model]
+horizon = 5              # bars ahead the models predict
+train_lookback = "5y"    # history used to train the production models
+test_fraction = 0.2      # last share of dates held out for testing
+cv_folds = 5
+fresh_hours = 12         # cached prices older than this are re-downloaded
+
+[research]
+lookback = "10y"
+test_fraction = 0.6      # walk-forward tests cover the last 60% of dates
+n_folds = 6
+
+[backtest]
+initial_capital = 10000
+commission = 0.001       # per side
+slippage = 0.0005        # per side
+vol_sizing = true        # volatility-based sizing on by default (supported by the research)
+vol_target = 0.40        # annual volatility target when vol_sizing is on
+n_shuffles = 20

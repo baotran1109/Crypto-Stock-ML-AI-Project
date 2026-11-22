@@ -1,6 +1,6 @@
 # Signal Research Findings
 
-**Bottom line:** none of the signals found is strong enough to trade on after costs. Price direction is not predictable from these features. Volatility is. A weak "which coin beats the others" signal exists but loses to simply holding all coins in most setups. Adding non-price data (funding rates, Fear & Greed, earnings, analyst ratings, macro) did not change that; see [Round 2](#round-2-non-price-data).
+**Bottom line:** none of the signals found is strong enough to trade on after costs. Price direction is not predictable from these features. Volatility is. A weak "which coin beats the others" signal exists but loses to simply holding all coins in most setups. Adding non-price data (funding rates, Fear & Greed, earnings, analyst ratings, macro) did not change that; see [Round 2](#round-2-non-price-data). On a 99-stock / 39-coin universe, the round-2 stock lead disappeared and crypto ranking stayed weak but consistent. A crypto rotation beat holding all coins in every configuration, but the coin list was chosen with hindsight; see [Round 3](#round-3-large-universe-99-stocks-39-coins).
 
 Generated from `python -m src.research` (172 walk-forward experiments + 13 rotation simulations, 10 years of daily data). Full tables: `signal_research.md`.
 
@@ -59,7 +59,7 @@ The same model looks brilliant on MSFT and useless on NVDA. One good backtest pr
 3. **No confidence-based sizing or stop-loss tuning was added.** Tuning these on a random signal would only fit noise.
 4. **Tried in round 2 with no direction edge:** funding rates, Fear & Greed, earnings surprises, analyst actions, yield curve and credit spreads.
 5. **Ideas not yet tried:**
-   - A much bigger universe (100+ stocks, 50+ coins)
+   - A point-in-time crypto universe (top coins by market cap as of each date) to retest the round-3 rotation without hindsight
    - Open interest and liquidations (no free long history from this region)
    - On-chain flows
    - Order-book data
@@ -105,6 +105,40 @@ Why the stock 20-day result is a lead and not a signal:
 Testing it properly needs a much bigger stock universe (for example 100+ S&P 500 stocks) so the market-direction effect can be separated from stock picking.
 
 The 2023+ crypto window shows 20-day direction at 0.63 with `+cross` alone. That window is one strong crypto bull market, so this most likely reflects "trend kept going" in that regime. Adding funding made it worse (0.58).
+
+## Round 3: large universe (99 stocks, 39 coins)
+
+`python -m src.research --universe large --quick`. Symbols are listed in `config.toml`. COMP-USD had no Yahoo data. Per-coin funding is left out because Hyperliquid doesn't list most of these coins. Full tables: `large/signal_research.md`.
+
+| Question | 10 symbols | Large universe | Verdict |
+|---|---|---|---|
+| Stock up/down in 20 days, `+macro` (the round-2 lead) | 0.56, all 6 periods | 0.52, 3 of 6 | **Lead gone.** It was a market-timing fluke on 10 correlated names |
+| Stock up/down in 5 days | 0.51 | 0.51 | Not predictable |
+| Stock beat the other stocks | 0.51 | 0.51 | No stock-picking signal |
+| Stock big move | 0.58–0.60 | 0.55–0.56, all 6 periods | Predictable |
+| Crypto beat the other coins | 0.53 | 0.53, all 6 periods | Weak but consistent |
+| Crypto big move | 0.55 | 0.56, all 6 periods | Predictable |
+| Crypto up/down in 20 days | 0.53–0.55 | 0.58, all 6 periods (logreg) | Lead, same caveat as before: coins move together |
+
+### Rotation on the large universe
+
+Hold the top-k symbols by predicted "beats the median", every 5–20 days, with costs. 13 configurations per asset class, all reported.
+
+**Stocks (99):** ML beat the equal-weight basket in 2 of 13 configurations and momentum in 1 of 13. No edge.
+
+**Crypto (39), June 2021 to Nov 2026:**
+- ML beat the equal-weight basket of all 39 coins in **13 of 13** configurations. The basket lost about 45%; ML returns ranged from −35% to +621%.
+- ML beat random picks in 98–100% of runs.
+- ML beat a plain 20-day momentum rule in 8 of 13.
+- Features with BTC/market context (`+cross`, `all`) did most of the work. Price-only features (`base`) were far weaker.
+
+**Why this is a lead, not a strategy:**
+- **The coin list was picked in 2026.** Coins that collapsed completely (e.g. LUNA, FTT) aren't in it, and a few of today's winners (ZEC, TRX) are. Most of the gap to the basket is "avoid the coins that bled out", which is easy to over-credit with hindsight. A fair test needs a point-in-time list: the top 40 coins by market cap as of each date.
+- **Drawdowns of 71–90%** on every ML configuration. Sharpe ratio 0.4–0.8.
+- **Yahoo prices for small coins** carry no liquidity or spread information. Real fills on small coins would cost more than 0.15–0.30%.
+- **Momentum gets most of the same result,** so the ML adds a modest amount on top of a known effect.
+
+Data check: no one-day moves over ±50% in the test window look like bad prices. They match real events, such as XRP on 2023-07-13. The extreme early values (SHIB and AAVE in 2020–21) fall in training data only.
 
 ## Caveat on multiple testing
 

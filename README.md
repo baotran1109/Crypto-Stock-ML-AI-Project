@@ -1,95 +1,142 @@
 # Crypto Stock ML AI Project
 
-A machine learning project that predicts short-term price direction for cryptocurrencies and stocks, backtests trading strategies honestly against simple benchmarks, and exposes everything through a web dashboard.
+[![tests](https://github.com/baotran1109/Crypto-Stock-ML-AI-Project/actions/workflows/tests.yml/badge.svg)](https://github.com/baotran1109/Crypto-Stock-ML-AI-Project/actions/workflows/tests.yml)
+
+A machine learning project for cryptocurrencies and stocks that **tests honestly what can and can't be predicted**, and builds its dashboard around what held up.
+
+- **Up or down?** Not predictable from price, volume, funding rates, sentiment, earnings or macro data. Every model tested scores about the same as a coin flip.
+- **Big move coming?** Predictable, for crypto and stocks alike, and better than random in every test period. That's the app's headline forecast.
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="reports/figures/auc_by_question-dark.png">
+  <img alt="ROC-AUC on unseen data by question: up/down and beat-the-others sit near 0.5 (coin flip); big move scores 0.54 for crypto and 0.58 for stocks" src="reports/figures/auc_by_question-light.png">
+</picture>
 
 ## What It Does
 
-- Loads OHLCV data for crypto and stocks from Yahoo Finance, with CoinGecko as a fallback for some coins.
-- Builds scale-free technical features (RSI, price vs EMAs, MACD as % of price, Bollinger Band position/width, returns, volatility) and a supervised dataset that predicts whether price will be higher in 5 days.
-- Trains **one model per asset class**: a crypto model on 10 coins and a stock model on 10 large stocks/ETFs. The app picks the right one for each symbol (`-USD` tickers use the crypto model).
-- Splits train/test by date (with a gap so labels never overlap), evaluates with walk-forward cross-validation, and saves the model, metrics and training dates.
-- Backtests a long-only strategy that trades on model confidence using the Backtrader framework, by default only on dates after the training period, and compares it against rule-based benchmarks and a shuffle test. Optional risk rules: volatility-based sizing, minimum holding period, slippage.
-- Includes a signal research harness that tests many targets, feature sets and models walk-forward, plus a crypto rotation simulation.
+- Loads OHLCV data from Yahoo Finance (CoinGecko as a fallback for some coins), plus non-price data:
+  - Crypto: funding rates and the Fear & Greed index.
+  - Stocks: earnings surprises, analyst ratings, yield curve and credit spreads.
+- Trains **two models per asset class** (crypto: 10 coins; stocks: 10 large stocks/ETFs):
+  - **Big-move model:** will the next 5 bars move more than usual, either direction? Test ROC-AUC 0.55 crypto, 0.60 stocks.
+  - **Direction model:** up or down in 5 bars? Kept for transparency; it scores about 0.50.
+- Splits train/test by date with a purge gap, evaluates walk-forward, and has automated tests that fail if any feature uses future data.
+- Backtests a long-only strategy with Backtrader, out-of-sample by default, against rule-based benchmarks and a shuffle test. Volatility-based sizing is on by default.
+- Includes a signal research harness with 170+ walk-forward experiments, a 100-stock / 40-coin large-universe mode, and rotation simulations.
 - Provides a Streamlit app with four pages: Prediction, Model Performance, Backtest, and Research.
 
-## Project Structure
+## The App
 
-- **src/data_loader.py** – Loads OHLCV from Yahoo Finance (and CoinGecko when needed). Caches data as CSV under the data folder. Normalizes column names and timezone.
-- **src/features.py** – Adds technical indicators and builds the supervised dataset (5-day ahead up/down target). Only scale-free columns in `FEATURE_COLS` are model inputs; raw dollar indicators are kept for charts.
-- **src/model_registry.py** – Training universes per asset class, `asset_class_for(symbol)`, and loading each class's artifacts.
-- **src/train_model.py** – Trains the crypto and stock models with a date-based split and walk-forward CV; saves each to `artifacts/<asset_class>/`.
-- **src/backtest.py** – One signal-driven Backtrader engine for the ML strategy, the benchmarks and the shuffle test, with optional risk rules.
-- **src/alt_data.py** – Non-price data from free sources, cached under data/alt/:
-  - Crypto: Fear & Greed index, Deribit BTC/ETH funding rates and Hyperliquid per-coin funding rates.
-  - Stocks: yfinance earnings and analyst actions, and FRED macro series.
-- **src/research.py** – Signal research harness (walk-forward grid over targets × feature sets × models, and a crypto rotation simulation). Writes `reports/`.
-- **app/streamlit_app.py** – Streamlit UI.
-- **data/** – Cached CSV files per symbol, source, and lookback (e.g. BTC_USD yahoo 5y).
-- **artifacts/crypto/**, **artifacts/stock/** – `model.pkl`, feature columns, evaluation metrics, feature importance, training metadata.
-- **reports/** – `FINDINGS.md` (summary), `signal_research.md` / `.csv` (every experiment), `rotation_research.csv`.
+- **Prediction:** enter a symbol (e.g. BTC-USD, AAPL) and see:
+  - **Big-move likelihood** (Low → High) and how often a big move really followed that level in testing.
+  - The typical 5-day move size.
+  - An **earnings warning** for stocks reporting within 14 days.
+  - The direction call underneath, with a coin-flip warning.
+- **Model Performance:** test metrics for both models per asset class, including the big-move model's hit rate per level.
+- **Backtest:** ML strategy vs buy & hold, SMA crossover, momentum and RSI rules, plus a shuffle test. Risk rules: volatility sizing (on by default), minimum holding period, slippage.
+- **Research:** the findings and every experiment table.
 
-## Requirements
-
-- Python 3 with packages listed in requirements.txt: streamlit, pandas, numpy, scikit-learn, joblib, yfinance, requests, urllib3, plotly, backtrader, lxml.
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="reports/figures/bigmove_levels-dark.png">
+  <img alt="Big-move hit rate by level in the hold-out test: stocks go from 38% at Low to 65% at High; crypto from 42% to 54%; normal is about 50%" src="reports/figures/bigmove_levels-light.png">
+</picture>
 
 ## Setup
 
-1. Create and activate a virtual environment (optional but recommended).
-2. Install dependencies: `pip install -r requirements.txt`
-3. Train the models once: `python -m src.train_model` (from the project root; needs network or existing cached data in data/).
-4. Run the app: `streamlit run app/streamlit_app.py` (from the project root).
+1. Create and activate a virtual environment: `python -m venv venv` then `venv\Scripts\activate` (Windows) or `source venv/bin/activate`.
+2. Install dependencies: `pip install -r requirements.txt` (and `pip install -r requirements-dev.txt` for tests and charts).
+3. Train the models: `python -m src.refresh` (downloads data and trains both model types for both asset classes).
+4. Run the app: `streamlit run app/streamlit_app.py`.
 
-## Usage
+Python 3.11 or newer is required (settings are read with `tomllib`).
 
-- **Training:** `python -m src.train_model` trains both models; `python -m src.train_model --classes stock` trains one. Set FORCE_REFRESH in the script to pull fresh data.
-- **Research:** `python -m src.research` runs the full experiment grid and rotation simulation (about 5 minutes; downloads 10 years of data the first time). `--quick` skips the Random Forest, `--no-rotation` skips the rotation simulation.
-- **Dashboard:** `streamlit run app/streamlit_app.py`, then use the sidebar to switch pages.
-- **Prediction:** Enter a symbol (e.g. BTC-USD, ETH-USD, AAPL) and click Predict to see UP/DOWN, P(up), which model was used, and a chart.
-- **Model Performance:** Pick the crypto or stock model to see its test metrics, walk-forward CV, per-symbol results and feature importance.
-- **Backtest:** Pick a symbol, confidence threshold, capital, commission, lookback and optional risk rules; see the ML strategy against benchmarks and the shuffle test.
-- **Research:** Shows `reports/FINDINGS.md` and the full experiment tables.
+## Commands
 
-## Data and Model
-
-- Data is cached under **data/** with filenames like SYMBOL__source__lookback.csv. Yahoo is tried first; CoinGecko is used as fallback for supported coins (e.g. BTC, ETH, SOL). A cache older than 12 hours is re-downloaded; if the download fails, the stale cache is used.
-- The models predict a binary target: whether close price in 5 days is above current close (1) or not (0). The last 5 days of history have no known outcome and are excluded from training. Features use only data up to the decision bar's close, and live prediction uses the latest bar the same way.
-- Crypto and stocks get separate models because they behave differently: crypto trades 24/7 and is several times more volatile, stocks trade weekdays and react to earnings, rates and the overall market.
-- A symbol outside a model's training list (e.g. TSM) still uses its asset class's model; the app notes that the model never saw that symbol's history.
-
-## Benchmarks
-
-Every backtest also runs these rules through the same engine, window, capital, commission and risk rules, so the comparison is fair:
-
-| Benchmark | Rule |
+| Command | What it does |
 |---|---|
-| Buy & hold | Buy on the first day and hold to the end. |
-| SMA 50/200 crossover | Long while the 50-day average is above the 200-day average. |
-| Momentum (20-day) | Long while the price is above its level 20 days ago. |
-| RSI mean reversion | Buy when RSI drops below 30, sell when it rises above 55. |
+| `python -m src.refresh` | Refresh all data and retrain every model. `--research` also reruns the research, `--data-only` skips training. |
+| `python -m src.train_model` | Train the direction models only. |
+| `python -m src.vol_model` | Train the big-move models only. |
+| `python -m src.research` | Full research grid on the default universe (~5 min). `--quick` skips random forest, `--no-rotation` skips rotation. |
+| `python -m src.research --universe large --quick` | Research on ~100 stocks and ~40 coins; writes `reports/large/`. |
+| `python -m pytest -q` | Run the test suite (offline, synthetic data). |
+| `python scripts/make_charts.py` | Regenerate the README charts in `reports/figures/`. |
 
-**Shuffle test:** the ML model's own buy/sell/hold signals are randomly reordered 20 times, keeping the same number of each signal but with random timing. If the model's timing has real skill, it should beat most shuffles (say 90% or more). Around 50% means its timing is no better than chance.
+### Keeping it up to date
 
-## Risk Rules (optional, Backtest page)
+Windows Task Scheduler, every weekday at 07:00 (replace the folder path):
 
-- **Volatility-based sizing:** position size = target volatility ÷ current annualized volatility (20-day), capped at 100%. Invests less when the market is wild.
-- **Minimum holding period:** exit signals are ignored until a position has been held this many bars, cutting back-and-forth trading.
-- **Slippage:** extra cost per trade side on top of commission.
+```
+schtasks /Create /SC WEEKLY /D MON,TUE,WED,THU,FRI /ST 07:00 /TN "CryptoStockML refresh" /TR "cmd /c cd /d C:\path\to\project && venv\Scripts\python.exe -m src.refresh >> refresh.log 2>&1"
+```
 
-These apply to every strategy in a run, not just the ML model.
+The sidebar of the app shows when each model was last trained.
+
+## Configuration
+
+All settings live in **`config.toml`**:
+- Symbol universes, default and large.
+- Prediction horizon and training lookback.
+- Test split and research folds.
+- Backtest defaults: capital, commission, slippage, volatility sizing.
+
+## Deploying (Streamlit Community Cloud)
+
+1. Push this repository to GitHub (cached data and trained models are committed, so the app works without retraining).
+2. Go to share.streamlit.io, sign in with GitHub, click **Create app**, pick this repository, branch `main`, main file `app/streamlit_app.py`.
+3. Under **Advanced settings**, choose Python 3.12. Deploy.
+
+Yahoo Finance sometimes rate-limits cloud servers. When a download fails, the app falls back to the cached data in `data/`, so it keeps working with the last committed prices.
+
+## Project Structure
+
+- **config.toml / src/config.py** – Settings, loaded once and shared by every module.
+- **src/data_loader.py** – Loads OHLCV from Yahoo Finance (CoinGecko fallback), caches CSVs under `data/`, falls back to a stale cache if offline.
+- **src/features.py** – Scale-free technical indicators and the 5-day up/down dataset.
+- **src/alt_data.py** – Non-price data, cached under `data/alt/`:
+  - Fear & Greed index, Deribit and Hyperliquid funding rates.
+  - yfinance earnings, next earnings date and analyst actions.
+  - FRED yield curve and credit spread.
+- **src/model_registry.py** – Asset-class detection and loading each class's artifacts.
+- **src/train_model.py** – Direction models: date split, walk-forward CV, saved to `artifacts/<asset_class>/`.
+- **src/vol_model.py** – Big-move models: walk-forward and hold-out scoring, per-level hit rates, live prediction.
+- **src/backtest.py** – One Backtrader engine for the ML strategy, benchmarks and shuffle test, with risk rules.
+- **src/research.py** – Research harness: targets × feature sets × models, walk-forward, rotation simulation, large-universe mode.
+- **src/refresh.py** – One command to refresh data and retrain.
+- **app/streamlit_app.py** – Streamlit UI.
+- **tests/** – pytest suite, run on every push by GitHub Actions (`.github/workflows/tests.yml`). It covers:
+  - No-look-ahead checks for every feature builder and for when earnings and analyst data become usable.
+  - The backtest engine.
+  - Walk-forward sanity: random features score ~0.5, a real signal is detected.
+- **scripts/make_charts.py** – README charts.
+- **reports/** – `FINDINGS.md` (summary), every experiment table, `large/` (large-universe run), `figures/`.
+
+## How Results Are Kept Honest
+
+- **Date-based splits with a purge gap:** no training label overlaps the test period.
+- **Walk-forward evaluation:** a result counts only if it beats random in every test period, not just on average.
+- **Leak tests:** every feature builder is tested so that adding future data can't change a past value. When a leak was planted on purpose, the tests caught it.
+- **Delayed non-price data:** each value is used only after it became public. Earnings, analyst actions and FRED data are used from the day after.
+- **Out-of-sample backtests:** they start after the training period, use the same engine and costs for every benchmark, and include a shuffle test.
+- **Every experiment is reported,** including the failures, with a multiple-testing caveat.
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="reports/figures/stock_periods-dark.png">
+  <img alt="Per-period ROC-AUC for stocks: big move stays between 0.56 and 0.65 in all six test periods; up/down hovers around 0.50" src="reports/figures/stock_periods-light.png">
+</picture>
 
 ## Research Findings (short version)
 
-See `reports/FINDINGS.md` for detail. Across 170+ walk-forward experiments:
+See [`reports/FINDINGS.md`](reports/FINDINGS.md) for detail.
 
-- **Price direction (up/down in 5 or 20 days) is not predictable** from these features, for crypto or stocks. Test ROC-AUC stays around 0.50.
-- **Volatility is predictable**: whether the next 5 days will have a big move scores ROC-AUC ~0.55 (crypto) and ~0.58 (stocks), in every test period. That supports volatility-based sizing, not direction calls.
-- **Non-price data** (funding rates, Fear & Greed, earnings surprises, analyst ratings, yield curve, credit spreads) did not make direction predictable. Earnings dates improved volatility prediction for stocks to ~0.60.
-- **Which coin will beat the other coins** over 5 days is weakly predictable (ROC-AUC ~0.52–0.53, every test period), but after trading costs a rotation strategy built on it does not reliably beat holding all coins, and a plain momentum rule beat it in most configurations.
+- **Price direction (up/down in 5 or 20 days) is not predictable** from any data tried, for crypto or stocks. Test ROC-AUC stays around 0.50.
+- **Volatility is predictable.** Whether the next 5 days will have a big move scores ROC-AUC ~0.55 for crypto and ~0.60 for stocks, in every test period. Earnings dates help most.
+- **Funding rates, Fear & Greed, earnings surprises, analyst ratings, yield curve and credit spreads** did not make direction predictable.
+- **On 99 stocks**, nothing predicts direction or which stocks will outperform. A 20-day lead seen on 10 stocks disappeared.
+- **Which coin will beat the other coins** is weakly but consistently predictable (~0.53). On 10 coins a rotation built on it doesn't beat holding all coins. On 39 coins it beat holding all coins in 13 of 13 setups, but with 71–90% drawdowns and a coin list chosen with hindsight. It's a lead to retest with a point-in-time coin list, not a strategy.
 
 ## Notes
 
-- Use symbol format BTC-USD, ETH-USD for crypto (not BTC-USDT). Use ticker symbols like AAPL, TSLA for stocks.
-- If the app says model files not found, run `python -m src.train_model` first.
-- The backtest is out-of-sample by default: it starts after the model's training period. Unticking that option includes training data and makes results look much better than they are.
-- Orders fill at the signal bar's close with fractional position sizes, so expensive assets like BTC can be traded with small capital.
-- A single backtest on one symbol is noisy. The same model can beat every benchmark on one stock and lose on the next; check the shuffle test and several symbols before reading anything into it.
+- Use BTC-USD, ETH-USD for crypto (not BTC-USDT) and plain tickers (AAPL, TSLA) for stocks. Any ticker ending in `-USD` uses the crypto models.
+- A single backtest on one symbol is noisy. The same model can beat every benchmark on one stock and lose on the next.
+- Nothing here is investment advice.

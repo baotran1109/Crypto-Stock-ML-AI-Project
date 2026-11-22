@@ -30,17 +30,18 @@ from sklearn.metrics import (
 
 from src.data_loader import load_crypto, _cache_path, _is_fresh
 from src.features import FEATURE_COLS, HORIZON, add_indicators, make_supervised
+from src.config import MODEL
 from src.model_registry import TRAINING_UNIVERSES, artifact_dir, artifact_path
 
 # ==========================================================
 # CONFIG
 # ==========================================================
-LOOKBACK = "5y"
-TEST_FRACTION = 0.2
-CV_FOLDS = 5
+LOOKBACK = MODEL["train_lookback"]       # settings live in config.toml
+TEST_FRACTION = MODEL["test_fraction"]
+CV_FOLDS = MODEL["cv_folds"]
 USE_XGB = False        # True to use XGBoost instead of Random Forest (pip install xgboost)
 FORCE_REFRESH = False  # True to ignore the cache and download fresh data
-FRESH_HOURS = 12       # cache older than this is re-downloaded (stale cache is used if offline)
+FRESH_HOURS = MODEL["fresh_hours"]  # cache older than this is re-downloaded (stale cache used if offline)
 
 
 def build_model():

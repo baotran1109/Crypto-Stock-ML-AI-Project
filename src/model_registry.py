@@ -5,6 +5,7 @@ One model per asset class. Crypto and stocks behave differently (24/7 vs weekday
 
 Artifacts live in artifacts/<asset_class>/:
     model.pkl, feature_columns.pkl, evaluation_metrics.pkl, feature_importance.pkl, training_metadata.pkl
+    vol_model.pkl, vol_metrics.pkl, vol_metadata.pkl   (big-move model, src/vol_model.py)
 """
 
 import os
@@ -12,14 +13,12 @@ from typing import Dict, Optional
 
 import joblib
 
+from src.config import UNIVERSES
+
 ARTIFACTS_ROOT = "artifacts"
 
 # Symbols each model is trained on
-TRAINING_UNIVERSES = {
-    "crypto": ["BTC-USD", "ETH-USD", "SOL-USD", "XRP-USD", "ADA-USD",
-               "DOGE-USD", "LINK-USD", "LTC-USD", "BNB-USD", "AVAX-USD"],
-    "stock": ["AAPL", "MSFT", "GOOGL", "AMZN", "META", "NVDA", "TSLA", "SPY", "QQQ", "DIA"],
-}
+TRAINING_UNIVERSES = {ac: list(syms) for ac, syms in UNIVERSES.items()}  # from config.toml
 
 ASSET_CLASS_LABELS = {"crypto": "Crypto", "stock": "Stocks"}
 
@@ -48,7 +47,11 @@ def load_artifacts(asset_class: str) -> Optional[Dict]:
         return None
     for key, fname in [("metrics", "evaluation_metrics.pkl"),
                        ("importance", "feature_importance.pkl"),
-                       ("metadata", "training_metadata.pkl")]:
+                       ("metadata", "training_metadata.pkl"),
+                       # big-move (volatility) model from src/vol_model.py, optional
+                       ("vol_model", "vol_model.pkl"),
+                       ("vol_metrics", "vol_metrics.pkl"),
+                       ("vol_metadata", "vol_metadata.pkl")]:
         try:
             bundle[key] = joblib.load(artifact_path(asset_class, fname))
         except (FileNotFoundError, OSError):

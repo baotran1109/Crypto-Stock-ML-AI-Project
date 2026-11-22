@@ -15,6 +15,9 @@ from src.data_loader import load_crypto
 from src.features import add_indicators
 from src.backtest import run_backtest
 from src.model_registry import ASSET_CLASS_LABELS, TRAINING_UNIVERSES, asset_class_for, load_artifacts
+from src.config import BACKTEST
+from src.vol_model import predict_big_move
+from src.alt_data import next_earnings
 
 st.set_page_config(page_title="Crypto/Stock Machine Learning Predictor", page_icon="🪙", layout="wide")
 st.title("Crypto/Stock Machine Learning Predictor 🪙")
@@ -40,10 +43,18 @@ for ac, b in bundles.items():
         st.sidebar.caption(f"{label}: not trained. Run `python -m src.train_model --classes {ac}`.")
     elif b.get("metadata"):
         m = b["metadata"]
+        vm = b.get("vol_metadata") or {}
         st.sidebar.caption(
             f"**{label}** model: {', '.join(m['symbols'])}\n\n"
-            f"Train {m['train_start']} → {m['train_end']} · Test {m['test_start']} → {m['test_end']}"
+            f"Train {m['train_start']} → {m['train_end']} · Test {m['test_start']} → {m['test_end']}\n\n"
+            f"Last trained: direction {m.get('trained_at', '?')[:10]}"
+            + (f", big-move {vm['trained_at'][:10]}" if vm.get("trained_at") else " (big-move model not trained)")
         )
+
+
+@st.cache_data(ttl=6 * 3600, show_spinner=False)
+def cached_next_earnings(sym: str):
+    return next_earnings(sym)
 
 # ==========================================================
 # PREDICTION PAGE
@@ -96,15 +107,59 @@ if page == "Prediction":
                                 f"({', '.join(training_meta['symbols'])}). It is the same asset class, so the model "
                                 "applies, but it has never seen this symbol's own history.")
                     
-                    # Display prediction
+                    # ---- Headline: big-move forecast (the prediction that works) ----
+                    st.subheader("Big move in the next 5 bars?")
+                    vol = None
+                    try:
+                        vol = predict_big_move(symbol, asset_class, bundle)
+                    except Exception as e:
+                        st.warning(f"Big-move forecast unavailable: {e}")
+                    current_price = df.iloc[-1]['close']
+                    if vol:
+                        c1, c2, c3 = st.columns(3)
+                        c1.metric("Big-move likelihood", vol["level_name"],
+                                  help="Which fifth of the last year's scores today's score falls in.")
+                        if vol["hit_rate"] is not None:
+                            c2.metric("Big move followed", f"{vol['hit_rate']:.0%} of the time",
+                                      delta=f"{vol['hit_rate'] - (vol['base_rate'] or 0.5):+.0%} vs normal",
+                                      delta_color="off",
+                                      help="In the model's test period, how often a big move followed days at this level.")
+                        c3.metric("Typical 5-bar move", f"±{vol['typical_move']:.1%}",
+                                  help="Median size of a 5-bar move over the past year. A 'big move' is larger than this, up or down.")
+                        vm = bundle.get("vol_metrics") or {}
+                        st.caption(f"A big move is a 5-bar move larger than ±{vol['typical_move']:.1%}, in either direction "
+                                   f"(normally about {vol['base_rate'] or 0.5:.0%} of the time). Test ROC-AUC "
+                                   f"{vm.get('holdout_roc_auc', float('nan')):.2f}, better than random in "
+                                   f"{vm.get('walk_forward', {}).get('folds_above_50', '?')}/"
+                                   f"{vm.get('walk_forward', {}).get('n_folds', '?')} test periods. "
+                                   "It says nothing about up or down.")
+                    elif bundle.get("vol_model") is None:
+                        st.info("Big-move model not trained. Run `python -m src.vol_model`.")
+
+                    # ---- Earnings warning (stocks) ----
+                    if asset_class == "stock":
+                        ne = cached_next_earnings(symbol.upper())
+                        if ne is not None:
+                            days = (ne.normalize() - pd.Timestamp.utcnow().tz_localize(None).normalize()).days
+                            if days <= 14:
+                                st.warning(f"📅 Earnings in {days} day{'s' if days != 1 else ''} ({ne.date()}). "
+                                           "Big moves cluster around earnings reports.")
+                            else:
+                                st.caption(f"Next earnings report: {ne.date()} (in {days} days).")
+
+                    # ---- Direction call: kept, but labelled for what it is ----
+                    st.subheader("Up or down?")
+                    m = bundle.get("metrics") or {}
                     col1, col2, col3 = st.columns(3)
                     with col1:
-                        st.metric("Prediction", "📈 UP" if pred == 1 else "📉 DOWN")
+                        st.metric("Direction model", "📈 UP" if pred == 1 else "📉 DOWN")
                     with col2:
                         st.metric("P(up)", f"{prob:.2%}")
                     with col3:
-                        current_price = df.iloc[-1]['close']
                         st.metric("Current Price", f"${current_price:,.2f}")
+                    st.warning(f"⚠️ Coin-flip level: the direction model's test ROC-AUC is "
+                               f"{m.get('roc_auc', float('nan')):.2f} (0.50 = random). Research across 170+ "
+                               "experiments found no reliable up/down signal. Don't treat this as a forecast.")
 
                     # Chart
                     chart_data = df.tail(chart_days)
@@ -247,6 +302,28 @@ elif page == "Model Performance":
     else:
         st.warning("⚠️ Evaluation metrics not found. Run `python -m src.train_model` to generate metrics.")
 
+    st.divider()
+    st.subheader("🌊 Big-move model")
+    vm, vmeta = bundle.get("vol_metrics"), bundle.get("vol_metadata")
+    if vm and vmeta:
+        st.caption(f"Predicts whether the next 5 bars move more than usual, either direction. Feature set "
+                   f"`{vmeta['feature_set']}`, data {vmeta['data_start']} → {vmeta['data_end']}.")
+        wf = vm["walk_forward"]
+        c1, c2, c3 = st.columns(3)
+        c1.metric("Hold-out ROC-AUC", f"{vm['holdout_roc_auc']:.3f}", help=f"{vm['test_start']} → {vm['test_end']}")
+        c2.metric("Walk-forward ROC-AUC", f"{wf['mean_auc']:.3f}", help=f"Worst period {wf['min_auc']:.3f}")
+        c3.metric("Periods better than random", f"{wf['folds_above_50']}/{wf['n_folds']}")
+        cal = pd.DataFrame(vm["calibration"])
+        cal.insert(0, "Level", ["Low", "Below normal", "Normal", "Above normal", "High"][:len(cal)])
+        cal = cal.rename(columns={"predicted": "Model score", "actual": "Big move happened", "n": "Days"})
+        st.markdown("**Hold-out test: how often a big move followed each level**")
+        st.dataframe(cal.style.format({"Model score": "{:.0%}", "Big move happened": "{:.0%}"}),
+                     width="stretch", hide_index=True)
+        st.caption("Raw model scores run high, so the Prediction page reports the level and its real hit rate, "
+                   "not the raw score.")
+    else:
+        st.info("Not trained yet. Run `python -m src.vol_model`.")
+
 # ==========================================================
 # BACKTEST PAGE
 # ==========================================================
@@ -266,7 +343,7 @@ elif page == "Backtest":
         with col1:
             st.write("**Cryptocurrencies:**")
             st.write("BTC-USD, ETH-USD, SOL-USD")
-            st.write("XRP-USD, MATIC-USD, DOGE-USD")
+            st.write("XRP-USD, ADA-USD, DOGE-USD")
         with col2:
             st.write("**Stocks:**")
             st.write("AAPL, TSLA, MSFT, GOOGL")
@@ -274,9 +351,9 @@ elif page == "Backtest":
 
     col1, col2, col3 = st.columns(3)
     with col1:
-        initial_capital = st.number_input("Initial Capital ($)", 1000, 1000000, 10000)
+        initial_capital = st.number_input("Initial Capital ($)", 1000, 1000000, int(BACKTEST["initial_capital"]))
     with col2:
-        commission = st.number_input("Commission (%)", 0.0, 1.0, 0.1, 0.01) / 100
+        commission = st.number_input("Commission (%)", 0.0, 1.0, BACKTEST["commission"] * 100, 0.01) / 100
     with col3:
         lookback_years = st.selectbox("Lookback Period", ["1y", "2y", "3y", "5y"], index=3)
 
@@ -284,17 +361,18 @@ elif page == "Backtest":
         "Out-of-sample only (after the model's training period)", value=True,
         help="Unticking this lets the backtest include dates the model was trained on, which inflates results.")
 
-    with st.expander("⚙️ Risk rules (applied to the ML model and every benchmark)"):
+    with st.expander("⚙️ Risk rules (applied to the ML model and every benchmark). Volatility sizing is on by default"):
         col1, col2, col3 = st.columns(3)
         with col1:
-            use_vol_target = st.checkbox("Volatility-based sizing", value=False,
+            use_vol_target = st.checkbox("Volatility-based sizing", value=bool(BACKTEST["vol_sizing"]),
                                          help="Invest less when the market is volatile: position = target vol / current vol, capped at 100%.")
-            vol_target_pct = st.slider("Target volatility (annual %)", 5, 100, 40, 5, disabled=not use_vol_target)
+            vol_target_pct = st.slider("Target volatility (annual %)", 5, 100, int(BACKTEST["vol_target"] * 100), 5,
+                                       disabled=not use_vol_target)
         with col2:
             min_hold = st.number_input("Minimum holding period (bars)", 0, 60, 0, 1,
                                        help="Ignore exit signals until a position has been held this long. Cuts back-and-forth trading.")
         with col3:
-            slippage_pct = st.number_input("Slippage per side (%)", 0.0, 1.0, 0.05, 0.01,
+            slippage_pct = st.number_input("Slippage per side (%)", 0.0, 1.0, BACKTEST["slippage"] * 100, 0.01,
                                            help="Extra cost per trade on top of commission, for fills worse than the close.")
     
     if st.button("Run Backtest", type="primary"):
@@ -499,7 +577,8 @@ elif page == "Research":
     st.header("🔬 Signal Research")
     st.caption("Results of `python -m src.research`: many target / feature / model combinations scored "
                "walk-forward on data each model never saw. Re-run that command to refresh this page.")
-    for name, label in [("FINDINGS.md", "Findings"), ("signal_research.md", "Full results")]:
+    for name, label in [("FINDINGS.md", "Findings"), ("signal_research.md", "Full results"),
+                        (os.path.join("large", "signal_research.md"), "Full results: large universe (~100 stocks, ~40 coins)")]:
         path = os.path.join("reports", name)
         if os.path.exists(path):
             with st.expander(label, expanded=(name == "FINDINGS.md")):

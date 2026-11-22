@@ -6,7 +6,9 @@ Compute indicators and prepare supervised learning dataset (pure pandas).
 import numpy as np
 import pandas as pd
 
-HORIZON = 5  # predict whether close is higher HORIZON trading bars ahead
+from src.config import MODEL
+
+HORIZON = MODEL["horizon"]  # predict whether close is higher HORIZON trading bars ahead (config.toml)
 
 # Model features. All are scale-free (ratios, returns, oscillators) so one model
 # can learn patterns that transfer between a $60k coin, a $0.50 coin and a stock.
